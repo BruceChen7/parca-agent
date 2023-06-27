@@ -69,8 +69,16 @@ func (ctx *parseContext) offset() int {
 	return ctx.totalLen - ctx.buf.Len()
 }
 
+// .eh_frame部分是一连串的记录。
+// 每条记录是一个CIE（通用信息条目）或FDE（帧描述条目）。
+// 一般来说，每个对象文件有一个CIE，每个CIE都与一个FDE列表相关
+// 每个FDE通常与一个函数相关联。CIE和FDE一起描述了如果当前指令指针在FDE覆盖的范围内，如何向调用者解压。
 func parselength(ctx *parseContext) parsefunc {
 	start := ctx.offset()
+	// 小端字节序
+	// 第一个4字节是长度
+	// 记录的长度。
+	// 读取4个字节。如果它们不是0xffffffffff，它们就是CIE或FDE记录的长度
 	err := binary.Read(ctx.buf, binary.LittleEndian, &ctx.length) // TODO(aarzilli): this does not support 64bit DWARF
 	if err != nil {
 		panic("Could not read from buffer")
@@ -81,6 +89,7 @@ func parselength(ctx *parseContext) parsefunc {
 		return parselength
 	}
 
+	// 第二个4字节是CIE id
 	var cieid uint32
 	err = binary.Read(ctx.buf, binary.LittleEndian, &cieid)
 	if err != nil {
@@ -89,12 +98,19 @@ func parselength(ctx *parseContext) parsefunc {
 
 	ctx.length -= 4 // take off the length of the CIE id / CIE pointer.
 
+	// CIE is Common Information Entry
+	// FDE 是 Frame Descriptor Entry
+	// 如果是CIE
+	// 一般来说对于CIE，它一般是0
 	if ctx.cieEntry(cieid) {
 		ctx.common = &CommonInformationEntry{Length: ctx.length, staticBase: ctx.staticBase, CIE_id: cieid}
+		// 设置CIE信息
 		ctx.ciemap[start] = ctx.common
+		// 下一步用来parse
 		return parseCIE
 	}
 
+	// 计算
 	if ctx.ehFrameAddr > 0 {
 		cieid = uint32(start - int(cieid) + 4)
 	}
@@ -111,10 +127,12 @@ func parselength(ctx *parseContext) parsefunc {
 
 func parseFDE(ctx *parseContext) parsefunc {
 	startOff := ctx.offset()
+	// 读取指定的长度
 	r := ctx.buf.Next(int(ctx.length))
 
 	reader := bytes.NewReader(r)
 	num := ctx.readEncodedPtr(addrSum(ctx.ehFrameAddr+uint64(startOff), reader), reader, ctx.frame.CIE.ptrEncAddr)
+	// frame 开始的地址
 	ctx.frame.begin = num + ctx.staticBase
 
 	// For the size field in .eh_frame only the size encoding portion of the
@@ -149,7 +167,7 @@ func parseFDE(ctx *parseContext) parsefunc {
 	}
 	ctx.frame.Instructions = r[off:]
 	ctx.length = 0
-
+	// 开始下一轮
 	return parselength
 }
 
@@ -158,16 +176,20 @@ func addrSum(base uint64, buf *bytes.Reader) uint64 {
 	return base + uint64(n)
 }
 
+// 用来parse CommonInformationEntry
 func parseCIE(ctx *parseContext) parsefunc {
 	data := ctx.buf.Next(int(ctx.length))
 	buf := bytes.NewBuffer(data)
 	// parse version
+	// 第一个字节是版本
 	ctx.common.Version, _ = buf.ReadByte()
 
 	// parse augmentation
+	// 以null结尾的增量字符串
 	ctx.common.Augmentation, _ = util.ParseString(buf)
 
 	if ctx.parsingEHFrame() {
+		// 比较老的gcc版本才是孙
 		if ctx.common.Augmentation == "eh" {
 			ctx.err = fmt.Errorf("unsupported 'eh' augmentation at %#x", ctx.offset())
 		}
@@ -177,12 +199,15 @@ func parseCIE(ctx *parseContext) parsefunc {
 	}
 
 	// parse code alignment factor
+	// 代码对齐因子，无符号的LEB128
 	ctx.common.CodeAlignmentFactor, _ = util.DecodeULEB128(buf)
 
 	// parse data alignment factor
+	// 数据对齐因子，是有符号的
 	ctx.common.DataAlignmentFactor, _ = util.DecodeSLEB128(buf)
 
 	// parse return address register
+	// 返回地址寄存器
 	if ctx.parsingEHFrame() && ctx.common.Version == 1 {
 		b, _ := buf.ReadByte()
 		ctx.common.ReturnAddressRegister = uint64(b)
@@ -193,14 +218,18 @@ func parseCIE(ctx *parseContext) parsefunc {
 	ctx.common.ptrEncAddr = ptrEncAbs
 
 	if ctx.parsingEHFrame() && len(ctx.common.Augmentation) > 0 {
+		// 获取无符号LEB128的数据
 		_, _ = util.DecodeULEB128(buf) // augmentation data length
 		for i := 1; i < len(ctx.common.Augmentation); i++ {
 			switch ctx.common.Augmentation[i] {
+			// 增量字符串是L
 			case 'L':
+				// Language Specification data area
 				_, _ = buf.ReadByte() // LSDA pointer encoding, we don't support this.
 			case 'R':
 				// Pointer encoding, describes how begin and size fields of FDEs are encoded.
 				b, _ := buf.ReadByte()
+				// 那么下一个字节是FDE编码
 				ctx.common.ptrEncAddr = ptrEnc(b)
 				if !ctx.common.ptrEncAddr.Supported() {
 					ctx.err = fmt.Errorf("pointer encoding not supported %#x at %#x", ctx.common.ptrEncAddr, ctx.offset())
@@ -208,11 +237,15 @@ func parseCIE(ctx *parseContext) parsefunc {
 				}
 			case 'S':
 				// Signal handler invocation frame, we don't support this but there is no associated data to read.
+				// 扩增字符串中的字符'S'意味着这个CIE代表一个调用信号处理程序的堆栈框架。
+
 			case 'P':
 				// Personality function encoded as a pointer encoding byte followed by
 				// the pointer to the personality function encoded as specified by the
 				// pointer encoding.
 				// We don't support this but have to read it anyway.
+				// 如果增强字符串中的下一个字符是P，则 CIE 中的下一个字节是personality function，即 DW_EH_PE_xxx 值。
+				// 接着是指向人格函数的指针，使用人格
 				b, _ := buf.ReadByte()
 				e := ptrEnc(b) &^ ptrEncIndirect
 				if !e.Supported() {
@@ -231,9 +264,11 @@ func parseCIE(ctx *parseContext) parsefunc {
 	// The rest of this entry consists of the instructions
 	// so we can just grab all of the data from the buffer
 	// cursor to length.
+	// 下一次要parse的Instructions
 	ctx.common.InitialInstructions = buf.Bytes() // ctx.buf.Next(int(ctx.length))
 	ctx.length = 0
 
+	// 继续下一个section的解析
 	return parselength
 }
 

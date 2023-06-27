@@ -58,6 +58,8 @@ func x64RegisterToString(reg uint64) string {
 
 // PrintTable is a debugging helper that prints the unwinding table to the given io.Writer.
 func (ptb *UnwindTableBuilder) PrintTable(writer io.Writer, path string, compact bool, pc *uint64) error {
+	// 读取FDE
+	// frame description entry
 	fdes, err := ReadFDEs(path)
 	if err != nil {
 		return err
@@ -163,6 +165,8 @@ func ReadFDEs(path string) (frame.FrameDescriptionEntries, error) {
 	}
 
 	// TODO: Byte order of a DWARF section can be different.
+	// 字节序列
+	// 指针大小
 	fdes, err := frame.Parse(ehFrame, obj.ByteOrder, 0, pointerSize(obj.Machine), sec.Addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse frame data: %w", err)

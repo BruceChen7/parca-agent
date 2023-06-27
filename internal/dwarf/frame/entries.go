@@ -47,6 +47,7 @@ func (fde *FrameDescriptionEntry) Begin() uint64 {
 
 // End returns address of last location for this frame.
 func (fde *FrameDescriptionEntry) End() uint64 {
+	// frame 开始的地方
 	return fde.begin + fde.size
 }
 
