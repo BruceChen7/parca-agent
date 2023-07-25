@@ -12,18 +12,14 @@ function(version='v0.0.1-alpha.3', serverVersion='v0.0.3-alpha.2')
     },
   };
 
-  local server = (import 'github.com/parca-dev/parca/deploy/lib/parca/parca.libsonnet')({
+  local server = (import 'parca/parca.libsonnet')({
     name: 'parca',
     namespace: ns.metadata.name,
     image: 'ghcr.io/parca-dev/parca:' + self.version,
     version: serverVersion,
     replicas: 1,
     corsAllowedOrigins: '*',
-  }) {
-    // Hide PSP: Removed in K8s 1.25
-    // TODO: Remove from lib or add option to to toggle it
-    podSecurityPolicy:: {},
-  };
+  });
 
   local agent = (import 'parca-agent/parca-agent.libsonnet')({
     name: 'parca-agent',
@@ -44,11 +40,7 @@ function(version='v0.0.1-alpha.3', serverVersion='v0.0.3-alpha.2')
     //   Docs for usage of Label Selector
     //   https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#label-selectors
     //   podLabelSelector: 'app=my-web-app,version=v1',
-  }) {
-    // Hide PSP: Removed in K8s 1.25
-    // TODO: Remove from lib or add option to to toggle it
-    podSecurityPolicy:: {},
-  };
+  });
 
 
   {

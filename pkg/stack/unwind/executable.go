@@ -96,13 +96,13 @@ func NewHasFramePointersCache(logger log.Logger, reg prometheus.Registerer) Fram
 
 func HasFramePointers(executable string) (bool, error) {
 	// TODO(kakkoyun): Migrate objectfile and pool.
-	elf, err := elf.Open(executable)
+	f, err := elf.Open(executable)
 	if err != nil {
 		return false, fmt.Errorf("failed to open ELF file for path %s: %w", executable, err)
 	}
-	defer elf.Close()
+	defer f.Close()
 
-	compiler := ainur.Compiler(elf)
+	compiler := ainur.Compiler(f)
 	// Go 1.7 [0] enabled FP for x86_64. arm64 got them enabled in 1.12 [1].
 	//
 	// Note: we don't take into account applications that use cgo yet.
@@ -124,6 +124,21 @@ func HasFramePointers(executable string) (bool, error) {
 		}
 
 		return want.LessThan(have), nil
+	}
+
+	// v8 uses a custom code generator for some of it's ahead-of-time functions. They do contain
+	// frame pointers, but no DWARF unwind information, so we force frame pointer unwinding as
+	// mixed mode unwinding (fp -> DWARF) won't work here.
+	//
+	// HACK: This is a somewhat a brittle check.
+	elfSymbols, err := f.Symbols()
+	if err != nil && !errors.Is(err, elf.ErrNoSymbols) {
+		return false, fmt.Errorf("failed to read symbols: %w", err)
+	}
+	for _, symbol := range elfSymbols {
+		if strings.Contains(symbol.Name, "InterpreterEntryTrampoline") {
+			return true, nil
+		}
 	}
 
 	// By default, assume there frame pointers are not present.

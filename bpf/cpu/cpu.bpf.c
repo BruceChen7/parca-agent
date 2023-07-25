@@ -5,9 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright 2022 The Parca Authors
 
-#include "../common.h"
-#include "../vmlinux.h"
-#include "hash.h"
+#include <common.h>
+#include <hash.h>
+#include <vmlinux.h>
 
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_endian.h>
@@ -97,7 +97,15 @@ struct unwinder_stats_t {
   u64 error_catchall;
   u64 error_should_never_happen;
   u64 error_pc_not_covered;
-  u64 error_jit;
+  u64 error_pc_not_covered_jit;
+  u64 error_jit_unupdated_mapping;
+  u64 error_jit_mixed_mode_disabled; // JIT error because mixed-mode unwinding is disabled
+  u64 error_jit_unwinding_machinery;
+  u64 success_jit_frame;
+  u64 success_jit_to_dwarf;
+  u64 success_dwarf_to_jit;
+  u64 success_dwarf_reach_bottom;
+  u64 success_jit_reach_bottom;
 };
 
 const volatile struct unwinder_config_t unwinder_config = {};
@@ -157,7 +165,7 @@ typedef struct {
 
 typedef struct {
   int pid;
-  int tgid;
+  int tid;
   int user_stack_id;
   int kernel_stack_id;
   int user_stack_id_dwarf;
@@ -267,7 +275,15 @@ DEFINE_COUNTER(error_unsupported_cfa_register);
 DEFINE_COUNTER(error_catchall);
 DEFINE_COUNTER(error_should_never_happen);
 DEFINE_COUNTER(error_pc_not_covered);
-DEFINE_COUNTER(error_jit);
+DEFINE_COUNTER(error_pc_not_covered_jit);
+DEFINE_COUNTER(error_jit_unwinding_machinery);
+DEFINE_COUNTER(error_jit_unupdated_mapping);
+DEFINE_COUNTER(error_jit_mixed_mode_disabled);
+DEFINE_COUNTER(success_jit_frame);
+DEFINE_COUNTER(success_jit_to_dwarf);
+DEFINE_COUNTER(success_dwarf_to_jit);
+DEFINE_COUNTER(success_dwarf_reach_bottom);
+DEFINE_COUNTER(success_jit_reach_bottom);
 
 static void unwind_print_stats() {
   // Do not use the LOG macro, always print the stats.
@@ -285,9 +301,17 @@ static void unwind_print_stats() {
   bpf_printk("\tunsup_cfa_reg=%lu", unwinder_stats->error_unsupported_cfa_register);
   bpf_printk("\tcatchall=%lu", unwinder_stats->error_catchall);
   bpf_printk("\tnever=%lu", unwinder_stats->error_should_never_happen);
-  bpf_printk("\tunsup_jit=%lu", unwinder_stats->error_jit);
+  bpf_printk("\terror_jit_unwinding_machinery=%lu", unwinder_stats->error_jit_unwinding_machinery);
+  bpf_printk("\tunsup_jit=%lu", unwinder_stats->error_jit_unupdated_mapping);
+  bpf_printk("\tunsup_jit_mixed_mode_disabled=%lu", unwinder_stats->error_jit_mixed_mode_disabled);
+  bpf_printk("\tjit_frame=%lu", unwinder_stats->success_jit_frame);
+  bpf_printk("\tjit_to_dwarf_switch=%lu", unwinder_stats->success_jit_to_dwarf);
+  bpf_printk("\tdwarf_to_jit_switch=%lu", unwinder_stats->success_dwarf_to_jit);
+  bpf_printk("\treached_bottom_frame_dwarf=%lu", unwinder_stats->success_dwarf_reach_bottom);
+  bpf_printk("\treached_bottom_frame_jit=%lu", unwinder_stats->success_jit_reach_bottom);
   bpf_printk("\ttotal_counter=%lu", unwinder_stats->total);
   bpf_printk("\t(not_covered=%lu)", unwinder_stats->error_pc_not_covered);
+  bpf_printk("\t(not_covered_jit=%lu)", unwinder_stats->error_pc_not_covered_jit);
   bpf_printk("");
 }
 
@@ -326,7 +350,7 @@ static __always_inline void *bpf_map_lookup_or_try_init(void *map, const void *k
 static __always_inline void request_unwind_information(struct bpf_perf_event_data *ctx, int user_pid) {
   char comm[20];
   bpf_get_current_comm(comm, 20);
-  LOG("[debug] no fp, no unwind info for PID: %d, comm: %s ctx IP: %llx", user_pid, comm, ctx->regs.ip);
+  LOG("[debug] no fp, no unwind info for PID: %d, comm: %s ctx IP: %llx", user_pid, comm, PT_REGS_IP(&ctx->regs));
 
   u64 payload = REQUEST_UNWIND_INFORMATION | user_pid;
   bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &payload, sizeof(u64));
@@ -549,23 +573,9 @@ static __always_inline bool retrieve_task_registers(u64 *ip, u64 *sp, u64 *bp) {
   void *ptr = stack + THREAD_SIZE - TOP_OF_KERNEL_STACK_PADDING;
   struct pt_regs *regs = ((struct pt_regs *)ptr) - 1;
 
-  err = bpf_probe_read_kernel((void *)ip, 8, &regs->ip);
-  if (err) {
-    LOG("bpf_probe_read_kernel failed err %d", err);
-    return false;
-  }
-
-  err = bpf_probe_read_kernel((void *)sp, 8, &regs->sp);
-  if (err) {
-    LOG("bpf_probe_read_kernel failed err %d", err);
-    return false;
-  }
-
-  err = bpf_probe_read_kernel((void *)bp, 8, &regs->bp);
-  if (err) {
-    LOG("bpf_probe_read_kernel failed err %d", err);
-    return false;
-  }
+  *ip = PT_REGS_IP_CORE(regs);
+  *sp = PT_REGS_SP_CORE(regs);
+  *bp = PT_REGS_FP_CORE(regs);
 
   return true;
 }
@@ -579,32 +589,35 @@ static __always_inline bool retrieve_task_registers(u64 *ip, u64 *sp, u64 *bp) {
 static __always_inline bool has_fp(u64 current_fp) {
   u64 next_fp;
   u64 ra;
+  int i;
 
-  for (int i = 0; i < MAX_STACK_DEPTH; i++) {
+  for (i = 0; i < MAX_STACK_DEPTH; i++) {
     int err = bpf_probe_read_user(&next_fp, 8, (void *)current_fp);
     bpf_probe_read_user(&ra, 8, (void *)current_fp + 8);
     if (err < 0) {
-      // LOG("[debug] fp read failed with %d", err);
-      return false;
-    }
-    // Some cpp binaries, such as testdata/out/basic-cpp
-    // seem to have rbp set to 1 in the bottom frame. This
-    // does not comply with the x86_64 ABI.
-    //
-    // Additionally, we consider that stacks with just one
-    // frame aren't valid. This is just a heuristic, as most
-    // processes should at least have two frames.
-    //
-    // For both cases above, we prefer to unwind using the
-    // DWARF-derived unwind information.
-    if (next_fp == 0) {
-      // LOG("[debug] fp success");
-      return i > 0;
+      // LOG("[debug] fp read failed with %d i %d", err, i);
+      // We might have reached the bottom frame.
+      break;
     }
     current_fp = next_fp;
   }
 
-  LOG("[debug] fp not enough frames");
+  // Some cpp binaries, such as testdata/out/basic-cpp
+  // seem to have rbp set to 1 in the bottom frame. This
+  // does not comply with the x86_64 ABI.
+  //
+  // Additionally, we consider that stacks with just 2
+  // frames aren't valid. This is just a heuristic, as most
+  // processes should at least have two frames.
+  //
+  // For both cases above, we prefer to unwind using the
+  // DWARF-derived unwind information.
+  if (next_fp == 0) {
+    // LOG("[debug] fp success: %d", i > 2);
+    return i > 2;
+  }
+
+  LOG("[debug] last frame pointer is not zero");
   return false;
 }
 
@@ -619,11 +632,16 @@ static __always_inline void add_stack(struct bpf_perf_event_data *ctx, u64 pid_t
   // mean different things in kernel and user space.
   //
   // - What we call PIDs in userspace, are TGIDs in kernel space.
-  // - What we call threads IDs in user space, are PIDs in kernel space.
+  // - What we call **thread IDs** in user space, are PIDs in kernel space.
+  // In other words, the process ID in the lower 32 bits (kernel's view of the PID,
+  // which in user space is usually presented as the thread ID),
+  // and the thread group ID in the upper 32 bits
+  // (what user space often thinks of as the PID).
+
   int user_pid = pid_tgid >> 32;
   int user_tgid = pid_tgid;
   stack_key.pid = user_pid;
-  stack_key.tgid = user_tgid;
+  stack_key.tid = user_tgid;
 
   if (method == STACK_WALKING_METHOD_DWARF) {
     int stack_hash = MurmurHash2((u32 *)unwind_state->stack.addresses, MAX_STACK_DEPTH * sizeof(u64) / sizeof(u32), 0);
@@ -675,6 +693,8 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
   bool reached_bottom_of_stack = false;
   u64 zero = 0;
 
+  bool dwarf_to_jit = false;
+
   unwind_state_t *unwind_state = bpf_map_lookup_elem(&heap, &zero);
   if (unwind_state == NULL) {
     LOG("unwind_state is NULL, should not happen");
@@ -697,12 +717,17 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
     if (unwind_table_result == FIND_UNWIND_JITTED) {
       if (!unwinder_config.mixed_stack_enabled) {
         LOG("JIT section, stopping. Please enable mixed-mode unwinding with the --dwarf-unwinding-mixed=true to profile JITed stacks.");
+        bump_unwind_error_jit_mixed_mode_disabled();
         return 1;
       }
 
       LOG("[debug] Unwinding JITed stacks");
 
       unwind_state->unwinding_jit = true;
+      if (dwarf_to_jit) {
+        dwarf_to_jit = false;
+        bump_unwind_success_dwarf_to_jit();
+      }
 
       u64 next_fp = 0;
       u64 ra = 0;
@@ -725,7 +750,7 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
         // For some weird reason commenting out this and the next err log line results in a panic
         // Using more than 3 arguments also results in a panic in some older kernels because of
         // https://github.com/libbpf/libbpf/blob/f7eb43b90f4c8882edf6354f8585094f8f3aade0/src/bpf_helpers.h#L287-L289
-        LOG("[debug] err = %d", err);
+        LOG("[error] rbp failed with err = %d", err);
         return 0;
       }
 
@@ -738,18 +763,28 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
         //  For some weird reason commenting out this and the next err log line results in a panic
         //  Using more than 3 arguments also results in a panic in some older kernels because of
         //  https://github.com/libbpf/libbpf/blob/f7eb43b90f4c8882edf6354f8585094f8f3aade0/src/bpf_helpers.h#L287-L289
-        LOG("[debug] err = %d", err);
+        LOG("[error] ra failed with err = %d", err);
         return 0;
       }
 
       if (next_fp == 0) {
         LOG("[info] found bottom frame while walking JITed section");
+        bump_unwind_success_jit_reach_bottom();
         return 1;
       }
 
-      // TODO(sylfrena): add comments to explain calculations
+      // Stacktraces are essentially a list of saved return addresses from function calls pushed onto a stack
+      // The base pointer (`rbp` in x86_64) is a register pushed onto the stack and points to/references the beginning of the stack
+      // The stack pointer(`rsp`) points to the frame at the `rbp`, updating the top of the stack to 8 bytes ahead of the `rbp`
+      // When the current instruction is pushed, top of the stack moves up by 1 frame, updating `rsp` by another 8 bytes
+      // Hence, we update current stack pointer by 16 bytes ahead of `rbp`
       unwind_state->sp = unwind_state->bp + 16;
       unwind_state->bp = next_fp;
+      // Rewinding the program counter to get the instruction pointer for the previous function
+      // would be ideal but is unreliable in `x86` due to variable width encoding. We can ensure correctness only by disassembling the `.text` section which would be unfeasible.
+      // Since return addresses always point to the next instruction to be executed after returning from the function
+      // (and stack grows downwards), subtracting 1 from the current `ra` gives us the current instruction pointer location,
+      // if not the exact instruction boundary
       unwind_state->ip = ra - 1;
       len = unwind_state->stack.len;
 
@@ -757,6 +792,7 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
       if (len >= 0 && len < MAX_STACK_DEPTH) {
         unwind_state->stack.addresses[len] = ra;
         unwind_state->stack.len++;
+        bump_unwind_success_jit_frame();
       }
 
       continue;
@@ -810,16 +846,16 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
     if (found_cfa_type == CFA_TYPE_END_OF_FDE_MARKER) {
       LOG("[info] PC %llx not contained in the unwind info, found marker", unwind_state->ip);
       reached_bottom_of_stack = true;
+      bump_unwind_success_dwarf_reach_bottom(); // assuming we only have unwind tables for DWARF frames, not FP or JIT frames
       break;
     }
 
     if (found_rbp_type == RBP_TYPE_UNDEFINED_RETURN_ADDRESS) {
       LOG("[info] null return address, end of stack", unwind_state->ip);
       reached_bottom_of_stack = true;
+      bump_unwind_success_dwarf_reach_bottom();
       break;
     }
-
-    LOG("[debug] Switching to mixed-mode unwinding");
 
     // Add address to stack.
     u64 len = unwind_state->stack.len;
@@ -838,8 +874,11 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
     }
 
     // Set unwind_state->unwinding_jit to false once we have checked for switch from JITed unwinding to DWARF unwinding
+    if (unwind_state->unwinding_jit) {
+      bump_unwind_success_jit_to_dwarf();
+      LOG("[debug] Switched to mixed-mode DWARF unwinding");
+    }
     unwind_state->unwinding_jit = false;
-    LOG("[debug] Switched to mixed-mode DWARF unwinding");
 
     if (found_rbp_type == RBP_TYPE_REGISTER || found_rbp_type == RBP_TYPE_EXPRESSION) {
       LOG("\t[error] frame pointer is %d (register or exp), bailing out", found_rbp_type);
@@ -904,8 +943,10 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
       }
 
       if (proc_info->is_jit_compiler) {
-        LOG("[info] rip=0, Section not added, yet");
-        bump_unwind_error_jit();
+        LOG("[warn] mapping not added yet");
+        request_refresh_process_info(ctx, user_pid);
+
+        bump_unwind_error_jit_unupdated_mapping();
         return 1;
       }
 
@@ -959,6 +1000,8 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
       LOG("======= reached main! =======");
       add_stack(ctx, pid_tgid, STACK_WALKING_METHOD_DWARF, unwind_state);
       bump_unwind_success_dwarf();
+      // success_dwarf_to_jit keeps track of transition from DWARF unwinding to JIT unwinding
+      dwarf_to_jit = true;
     } else {
       int user_pid = pid_tgid;
       process_info_t *proc_info = bpf_map_lookup_elem(&process_info, &user_pid);
@@ -968,8 +1011,10 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
       }
 
       if (proc_info->is_jit_compiler) {
-        LOG("[info] Section not added, yet");
-        bump_unwind_error_jit();
+        LOG("[warn] mapping not added yet to BPF maps, rbp %llx", unwind_state->bp);
+        request_refresh_process_info(ctx, user_pid);
+        bump_unwind_error_jit_unupdated_mapping(); // rbp != 0 and we are expecting unwind info which is absent and not expecting JITed stacks and therefore are
+                                                   // not symbolising JITed stacks here but maybe it's a JIT stack
         return 1;
       }
 
@@ -990,7 +1035,7 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
 }
 
 // Set up the initial registers to start unwinding.
-static __always_inline bool set_initial_state(struct pt_regs *regs) {
+static __always_inline bool set_initial_state(bpf_user_pt_regs_t *regs) {
   u32 zero = 0;
 
   unwind_state_t *unwind_state = bpf_map_lookup_elem(&heap, &zero);
@@ -1009,7 +1054,7 @@ static __always_inline bool set_initial_state(struct pt_regs *regs) {
   u64 sp = 0;
   u64 bp = 0;
 
-  if (in_kernel(regs->ip)) {
+  if (in_kernel(PT_REGS_IP(regs))) {
     if (retrieve_task_registers(&ip, &sp, &bp)) {
       // we are in kernelspace, but got the user regs
       unwind_state->ip = ip;
@@ -1021,9 +1066,9 @@ static __always_inline bool set_initial_state(struct pt_regs *regs) {
     }
   } else {
     // in userspace
-    unwind_state->ip = regs->ip;
-    unwind_state->sp = regs->sp;
-    unwind_state->bp = regs->bp;
+    unwind_state->ip = PT_REGS_IP(regs);
+    unwind_state->sp = PT_REGS_SP(regs);
+    unwind_state->bp = PT_REGS_FP(regs);
   }
 
   return true;
@@ -1069,11 +1114,7 @@ int profile_cpu(struct bpf_perf_event_data *ctx) {
     return 0;
   }
 
-  if (has_fp(unwind_state->bp)) {
-    add_stack(ctx, pid_tgid, STACK_WALKING_METHOD_FP, NULL);
-    return 0;
-  }
-
+  // 1. If we have unwind information for a process, use it.
   if (has_unwind_information(user_pid)) {
     bump_samples();
 
@@ -1086,22 +1127,24 @@ int profile_cpu(struct bpf_perf_event_data *ctx) {
         return 1;
       }
 
-      LOG("[warn] IP 0x%llx not covered, could be a new/JIT mapping.", unwind_state->ip);
-
       if (unwind_table_result == FIND_UNWIND_MAPPING_NOT_FOUND) {
+        LOG("[warn] IP 0x%llx not covered, mapping not found.", unwind_state->ip);
         request_refresh_process_info(ctx, user_pid);
         bump_unwind_error_pc_not_covered();
         return 1;
       } else if (unwind_table_result == FIND_UNWIND_JITTED) {
         if (!unwinder_config.mixed_stack_enabled) {
-          bump_unwind_error_jit();
+          LOG("[warn] IP 0x%llx not covered, JIT (but mixed-mode unwinding disabled)!.", unwind_state->ip);
+          bump_unwind_error_pc_not_covered_jit();
+          bump_unwind_error_jit_mixed_mode_disabled();
           return 1;
         }
       } else if (proc_info->is_jit_compiler) {
-
+        LOG("[warn] IP 0x%llx not covered, may be JIT!.", unwind_state->ip);
         request_refresh_process_info(ctx, user_pid);
-        // We assume this failed because of a new JIT segment.
-        bump_unwind_error_jit();
+        bump_unwind_error_pc_not_covered_jit();
+        // We assume this failed because of a new JIT segment so we refresh mappings to find JIT segment in updated mappings
+        bump_unwind_error_jit_unupdated_mapping();
         return 1;
       }
     }
@@ -1111,6 +1154,14 @@ int profile_cpu(struct bpf_perf_event_data *ctx) {
     return 0;
   }
 
+  // 2. We did not have unwind information, let's see if we can unwind with frame
+  // pointers.
+  if (has_fp(unwind_state->bp)) {
+    add_stack(ctx, pid_tgid, STACK_WALKING_METHOD_FP, NULL);
+    return 0;
+  }
+
+  // 3. Request unwind information.
   request_unwind_information(ctx, user_pid);
   return 0;
 }

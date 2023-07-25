@@ -41,8 +41,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	promconfig "github.com/prometheus/common/config"
 	"github.com/prometheus/procfs"
 	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/zcalusic/sysinfo"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/automaxprocs/maxprocs"
 	"google.golang.org/grpc"
@@ -52,9 +55,11 @@ import (
 	_ "google.golang.org/grpc/encoding/proto"
 
 	"github.com/parca-dev/parca-agent/pkg/agent"
+	"github.com/parca-dev/parca-agent/pkg/analytics"
 	"github.com/parca-dev/parca-agent/pkg/buildinfo"
 	"github.com/parca-dev/parca-agent/pkg/byteorder"
 	"github.com/parca-dev/parca-agent/pkg/config"
+	"github.com/parca-dev/parca-agent/pkg/cpuinfo"
 	"github.com/parca-dev/parca-agent/pkg/debuginfo"
 	"github.com/parca-dev/parca-agent/pkg/discovery"
 	parcagrpc "github.com/parca-dev/parca-agent/pkg/grpc"
@@ -106,13 +111,13 @@ const (
 
 type flags struct {
 	Log         FlagsLogs `embed:""                         prefix:"log-"`
-	HTTPAddress string    `default:":7071"                  help:"Address to bind HTTP server to."`
+	HTTPAddress string    `default:"127.0.0.1:7071"         help:"Address to bind HTTP server to."`
 	Version     bool      `help:"Show application version."`
 
 	Node               string `default:"${hostname}"               help:"The name of the node that the process is running on. If on Kubernetes, this must match the Kubernetes node name."`
 	ConfigPath         string `default:""                          help:"Path to config file."`
 	MemlockRlimit      uint64 `default:"${default_memlock_rlimit}" help:"The value for the maximum number of bytes of memory that may be locked into RAM. It is used to ensure the agent can lock memory for eBPF maps. 0 means no limit."`
-	ObjectFilePoolSize int    `default:"128"                       help:"The maximum number of object files to keep in the pool. This is used to avoid re-reading object files from disk. It keeps FDs open, so it should be kept in sync with ulimits. 0 means no limit."`
+	ObjectFilePoolSize int    `default:"512"                       help:"The maximum number of object files to keep in the pool. This is used to avoid re-reading object files from disk. It keeps FDs open, so it should be kept in sync with ulimits. 0 means no limit."`
 
 	// pprof.
 	MutexProfileFraction int `default:"0" help:"Fraction of mutex profile samples to collect."`
@@ -126,6 +131,8 @@ type flags struct {
 	Symbolizer     FlagsSymbolizer     `embed:"" prefix:"symbolizer-"`
 	DWARFUnwinding FlagsDWARFUnwinding `embed:"" prefix:"dwarf-unwinding-"`
 	OTLP           FlagsOTLP           `embed:"" prefix:"otlp-"`
+
+	AnalyticsOptOut bool `default:"false" help:"Opt out of sending anonymous usage statistics."`
 
 	Hidden FlagsHidden `embed:"" hidden:"" prefix:""`
 
@@ -178,7 +185,7 @@ type FlagsRemoteStore struct {
 
 	BatchWriteInterval time.Duration `default:"10s"   help:"Interval between batch remote client writes. Leave this empty to use the default value of 10s."`
 	RPCLoggingEnable   bool          `default:"false" help:"Enable gRPC logging."`
-	RPCUnaryTimeout    time.Duration `default:"1m"    help:"Timeout for unary gRPC requests."`
+	RPCUnaryTimeout    time.Duration `default:"5m"    help:"Maximum timeout window for unary gRPC requests including retries."`
 }
 
 // FlagsDebuginfo contains flags to configure debuginfo.
@@ -267,11 +274,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	if runtime.GOARCH == "arm64" {
-		level.Error(logger).Log("msg", "ARM64 support is currently in progress. See https://github.com/parca-dev/parca-agent/discussions/1376")
-		os.Exit(1)
-	}
-
 	if byteorder.GetHostByteOrder() == binary.BigEndian {
 		level.Error(logger).Log("msg", "big endian CPUs are not supported")
 		os.Exit(1)
@@ -286,6 +288,11 @@ func main() {
 
 	intro := figure.NewColorFigure("Parca Agent ", "roman", "yellow", true)
 	intro.Print()
+
+	if runtime.GOARCH == "arm64" {
+		flags.DWARFUnwinding.Disable = true
+		level.Info(logger).Log("msg", "ARM64 support is currently in beta. DWARF-based unwinding is not supported yet, see https://github.com/parca-dev/parca-agent/discussions/1376 for more details")
+	}
 
 	// Memlock rlimit 0 means no limit.
 	if flags.MemlockRlimit != 0 {
@@ -479,6 +486,40 @@ func run(logger log.Logger, reg *prometheus.Registry, flags flags) error {
 		})
 	}
 
+	if !flags.AnalyticsOptOut {
+		logger := log.With(logger, "group", "analytics")
+		c := analytics.NewClient(
+			tp,
+			&http.Client{
+				Transport: otelhttp.NewTransport(
+					promconfig.NewUserAgentRoundTripper(
+						fmt.Sprintf("parca.dev/analytics-client/%s", version),
+						http.DefaultTransport),
+				),
+			},
+			"parca-agent",
+			time.Second*5,
+		)
+		var si sysinfo.SysInfo
+		si.GetSysInfo()
+		a := analytics.NewSender(
+			logger,
+			c,
+			runtime.GOARCH,
+			cpuinfo.NumCPU(),
+			version,
+			si,
+			isContainer,
+		)
+		ctx, cancel := context.WithCancel(ctx)
+		g.Add(func() error {
+			a.Run(ctx)
+			return nil
+		}, func(error) {
+			cancel()
+		})
+	}
+
 	if localStorageEnabled {
 		profileStore = profiler.NewFileStore(flags.LocalStore.Directory)
 		level.Info(logger).Log("msg", "local profile storage is enabled", "dir", flags.LocalStore.Directory)
@@ -511,7 +552,6 @@ func run(logger log.Logger, reg *prometheus.Registry, flags flags) error {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
-	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
 	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 	// Set the pprof profile handler only once we have loaded our BPF program to avoid
@@ -621,7 +661,9 @@ func run(logger log.Logger, reg *prometheus.Registry, flags flags) error {
 			metadata.Target(flags.Node, flags.Metadata.ExternalLabels),
 			metadata.Compiler(logger, reg, ofp),
 			metadata.Process(pfs),
-			metadata.JavaProcess(logger, nsCache),
+			metadata.Java(logger, nsCache),
+			metadata.Ruby(pfs, reg, ofp),
+			metadata.Python(pfs, reg, ofp),
 			metadata.System(),
 			metadata.PodHosts(),
 		},
@@ -641,7 +683,7 @@ func run(logger log.Logger, reg *prometheus.Registry, flags flags) error {
 	if !flags.Debuginfo.UploadDisable {
 		dbginfo = debuginfo.New(
 			log.With(logger, "component", "debuginfo"),
-			tp.Tracer("debuginfo"),
+			tp,
 			reg,
 			ofp,
 			debuginfoClient,

@@ -31,7 +31,7 @@ builds:
       - amd64
     hooks:
       pre:
-        - make libbpf
+        - make ARCH=amd64 libbpf
         - ./scripts/download-async-profiler.sh
     flags:
       - -mod=readonly
@@ -40,7 +40,7 @@ builds:
     ldflags:
       # https://goreleaser.com/customization/build/#reproducible-builds
       # {{.CommitDate}} is the date of the commit to make builds reproducible.
-      - -X main.version={{.Version}} -X main.commit={{.FullCommit}} -X main.date={{.CommitDate}} -X main.goArch={{.Runtime.Goarch}}
+      - -X main.version={{.Version}} -X main.commit={{.FullCommit}} -X main.date={{.CommitDate}} -X main.goArch=amd64
       - -extldflags=-static
     tags:
       - osusergo
@@ -71,23 +71,23 @@ builds:
     ldflags:
       # https://goreleaser.com/customization/build/#reproducible-builds
       # {{.CommitDate}} is the date of the commit to make builds reproducible.
-      - -X main.version={{.Version}} -X main.commit={{.FullCommit}} -X main.date={{.CommitDate}} -X main.goArch={{.Runtime.Goarch}}
+      - -X main.version={{.Version}} -X main.commit={{.FullCommit}} -X main.date={{.CommitDate}} -X main.goArch=arm64
       - -extldflags=-static
     tags:
       - osusergo
       - netgo
 archives:
-    # e.g. parca_0.15.0_Darwin_arm64.tar.gz, parca_0.15.0_Darwin_x86_64.tar.gz, parca_0.15.0_Linux_arm64.tar.gz, parca_0.15.0_Linux_x86_64.tar.gz
+    # e.g. parca_agent_0.15.0_Linux_aarch64.tar.gz, parca_agent_0.15.0_Linux_x86_64.tar.gz
   - name_template: >-
       {{ .ProjectName }}_
       {{- trimprefix .Version "v" }}_
       {{- title .Os }}_
       {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "arm64" }}aarch64
       {{- else }}{{ .Arch }}{{ end }}
     format_overrides:
       - goos: windows
         format: zip
-    rlcp: true # This can be removed once it's the default behavior
     files:
       - 'LICENSE*'
       - 'README*'

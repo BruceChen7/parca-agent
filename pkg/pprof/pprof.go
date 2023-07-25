@@ -19,13 +19,14 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"strings"
+	"strconv"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	pprofprofile "github.com/google/pprof/profile"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/procfs"
 
 	"github.com/parca-dev/parca-agent/pkg/ksym"
 	"github.com/parca-dev/parca-agent/pkg/perf"
@@ -87,14 +88,18 @@ type Converter struct {
 	kernelLocationIndex  map[string]*pprofprofile.Location
 	vdsoLocationIndex    map[string]*pprofprofile.Location
 
+	pfs           procfs.FS
 	pid           int
 	mappings      []*process.Mapping
 	kernelMapping *pprofprofile.Mapping
+
+	threadNameCache map[int]string
 
 	result *pprofprofile.Profile
 }
 
 func (m *Manager) NewConverter(
+	pfs procfs.FS,
 	pid int,
 	mappings process.Mappings,
 	captureTime time.Time,
@@ -121,9 +126,12 @@ func (m *Manager) NewConverter(
 		kernelLocationIndex:  map[string]*pprofprofile.Location{},
 		vdsoLocationIndex:    map[string]*pprofprofile.Location{},
 
+		pfs:           pfs,
 		pid:           pid,
 		mappings:      mappings,
 		kernelMapping: kernelMapping,
+
+		threadNameCache: map[int]string{},
 
 		result: &pprofprofile.Profile{
 			TimeNanos:     captureTime.UnixNano(),
@@ -143,6 +151,11 @@ func (m *Manager) NewConverter(
 	}
 }
 
+const (
+	threadIDLabel   = "thread_id"
+	threadNameLabel = "thread_name"
+)
+
 // Convert converts a profile to a pprof profile. It is intended to only be
 // used once.
 func (c *Converter) Convert(ctx context.Context, rawData []profile.RawSample) (*pprofprofile.Profile, error) {
@@ -159,10 +172,16 @@ func (c *Converter) Convert(ctx context.Context, rawData []profile.RawSample) (*
 		kernelSymbols = map[uint64]string{}
 	}
 
+	proc, err := c.pfs.Proc(c.pid)
+	if err != nil {
+		level.Debug(c.logger).Log("msg", "failed to get process info", "pid", c.pid, "err", err)
+	}
+
 	for _, sample := range rawData {
 		pprofSample := &pprofprofile.Sample{
 			Value:    []int64{int64(sample.Value)},
 			Location: make([]*pprofprofile.Location, 0, len(sample.UserStack)+len(sample.KernelStack)),
+			Label:    make(map[string][]string),
 		}
 
 		for _, addr := range sample.KernelStack {
@@ -183,17 +202,19 @@ func (c *Converter) Convert(ctx context.Context, rawData []profile.RawSample) (*
 			switch {
 			case pprofMapping.File == "[vdso]":
 				pprofSample.Location = append(pprofSample.Location, c.addVDSOLocation(processMapping, pprofMapping, addr))
-			case pprofMapping.File == "jit":
-				pprofSample.Location = append(pprofSample.Location, c.addPerfMapLocation(pprofMapping, addr))
-			case strings.HasSuffix(pprofMapping.File, ".dump"):
-				// TODO: The .dump is only a convention, it doesn't have to
-				// have this suffix. Better would be to check the magic number
-				// of the mapping file:
-				// https://elixir.bootlin.com/linux/v4.10/source/tools/perf/Documentation/jitdump-specification.txt
+			case processMapping.NoFileMapping:
+				pprofSample.Location = append(pprofSample.Location, c.addJitLocation(c.mappings, pprofMapping, addr))
+			case processMapping.IsJitDump:
 				pprofSample.Location = append(pprofSample.Location, c.addJITDumpLocation(pprofMapping, addr, pprofMapping.File))
 			default:
 				pprofSample.Location = append(pprofSample.Location, c.addAddrLocation(processMapping, pprofMapping, addr))
 			}
+		}
+
+		pprofSample.Label[threadIDLabel] = append(pprofSample.Label[threadIDLabel], strconv.FormatUint(uint64(sample.TID), 10))
+		threadName := c.threadName(proc, int(sample.TID))
+		if threadName != "" {
+			pprofSample.Label[threadNameLabel] = append(pprofSample.Label[threadNameLabel], threadName)
 		}
 
 		c.result.Sample = append(c.result.Sample, pprofSample)
@@ -305,12 +326,26 @@ func (c *Converter) addAddrLocationNoNormalization(m *pprofprofile.Mapping, addr
 	return l
 }
 
-func (c *Converter) addPerfMapLocation(
+func (c *Converter) addJitLocation(
+	mappings process.Mappings,
 	m *pprofprofile.Mapping,
 	addr uint64,
 ) *pprofprofile.Location {
 	if c.m.disableJITSymbolization {
 		return c.addAddrLocationNoNormalization(m, addr)
+	}
+
+	// We have an address that does not have a backing file, therefore we first
+	// try to symbolize using any of the mappings we've found to be jitdumps.
+	// Unfortunately this is unspecified and different JITs do different
+	// things. Eg. nodejs correctly annotates mappings with their backing
+	// jitdump file, but Julia does not.
+	for i, mapping := range mappings {
+		if mapping.IsJitDump {
+			if l := c.getJITDumpLocation(c.result.Mapping[i], addr, mapping.Pathname); l != nil {
+				return l
+			}
+		}
 	}
 
 	perfMap, err := c.perfMap()
@@ -363,19 +398,30 @@ func (c *Converter) addJITDumpLocation(
 		return c.addAddrLocationNoNormalization(m, addr)
 	}
 
+	if l := c.getJITDumpLocation(m, addr, path); l != nil {
+		return l
+	}
+
+	return c.addAddrLocationNoNormalization(m, addr)
+}
+
+func (c *Converter) getJITDumpLocation(
+	m *pprofprofile.Mapping,
+	addr uint64,
+	path string,
+) *pprofprofile.Location {
 	jitdump, err := c.jitdump(path)
 	if err != nil {
 		level.Debug(c.logger).Log("msg", "failed to get perf map for PID", "err", err)
 	}
 
 	if jitdump == nil {
-		return c.addAddrLocationNoNormalization(m, addr)
+		return nil
 	}
 
 	symbol, err := jitdump.Lookup(addr)
 	if err != nil {
-		level.Debug(c.logger).Log("msg", "failed to lookup symbol for address", "address", fmt.Sprintf("%x", addr), "err", err)
-		return c.addAddrLocationNoNormalization(m, addr)
+		return nil
 	}
 
 	if l, ok := c.jitdumpLocationIndex[symbol]; ok {
@@ -425,4 +471,25 @@ func (c *Converter) addFunction(
 	c.result.Function = append(c.result.Function, f)
 
 	return f
+}
+
+func (c *Converter) threadName(proc procfs.Proc, tid int) string {
+	threadName, ok := c.threadNameCache[tid]
+	if ok {
+		return threadName
+	}
+
+	tp, err := proc.Thread(tid)
+	if err != nil {
+		level.Debug(c.logger).Log("msg", "failed to get thread info", "pid", c.pid, "tid", tid, "err", err)
+		return ""
+	}
+	threadName, err = tp.Comm()
+	if err != nil {
+		level.Debug(c.logger).Log("msg", "failed to get thread name", "pid", c.pid, "tid", tid, "err", err)
+		return ""
+	}
+
+	c.threadNameCache[tid] = threadName
+	return threadName
 }

@@ -14,14 +14,14 @@ name: "CodeQL"
 on:
   push:
     branches:
-    - main
-    - release-*
+      - main
+      - release-*
   pull_request:
     branches:
-    - main
-    - release-*
+      - main
+      - release-*
   schedule:
-    - cron: '28 16 * * 3'
+    - cron: "28 16 * * 3"
 
 jobs:
   analyze:
@@ -35,7 +35,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [ 'go' ]
+        language: ["go"]
         # CodeQL supports [ 'cpp', 'csharp', 'go', 'java', 'javascript', 'python' ]
         # Learn more:
         # https://docs.github.com/en/free-pro-team@latest/github/finding-security-vulnerabilities-and-errors-in-your-code/configuring-code-scanning#changing-the-languages-that-are-analyzed
@@ -50,7 +50,7 @@ jobs:
           go-version-file: .go-version
 
       - name: Set up Clang
-        uses: KyleMayes/install-llvm-action@f8f2154d96f018dcb600739c4978bfc35f435422 # v1.8.1
+        uses: KyleMayes/install-llvm-action@c135b3937686fd69c2651507aabc9925a8f9eee8 # v1.8.3
         with:
           version: "14"
 
@@ -67,7 +67,7 @@ jobs:
 
       # Initializes the CodeQL tools for scanning.
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@f6e388ebf0efc915c6c5b165b019ee61a6746a38 # v2.20.1
+        uses: github/codeql-action/init@1813ca74c3faaa3a2da2070b9b8a0b3e7373a0d8 # v2.21.0
         with:
           languages: ${{ matrix.language }}
           # If you wish to specify custom queries, you can do so here or in a config file.
@@ -83,7 +83,10 @@ jobs:
       # ℹ️ Command-line programs to run using the OS shell.
       # 📚 https://git.io/JvXDl
 
+      - name: Set up environment
+        run: ./env.sh
+
       - run: make build
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@f6e388ebf0efc915c6c5b165b019ee61a6746a38 # v2.20.1
+        uses: github/codeql-action/analyze@1813ca74c3faaa3a2da2070b9b8a0b3e7373a0d8 # v2.21.0

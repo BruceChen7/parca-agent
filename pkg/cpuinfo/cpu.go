@@ -11,38 +11,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package profile
+package cpuinfo
 
-import "io"
+import "runtime"
 
-type PID uint32
-
-type ProcessRawData struct {
-	PID        PID
-	RawSamples []RawSample
-}
-
-type RawSample struct {
-	TID         PID
-	UserStack   []uint64
-	KernelStack []uint64
-	Value       uint64
-}
-
-type RawData []ProcessRawData
-
-type Function struct {
-	Name      string
-	Filename  string
-	StartLine int
-}
-
-type Line struct {
-	Function
-	Line int
-}
-
-type Writer interface {
-	Write(io.Writer) error
-	WriteUncompressed(io.Writer) error
+func NumCPU() int {
+	return runtime.NumCPU()
 }

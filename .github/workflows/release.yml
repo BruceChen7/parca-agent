@@ -10,7 +10,7 @@ permissions:
 
 env:
   # renovate: datasource=go depName=github.com/goreleaser/goreleaser
-  GORELEASER_VERSION: v1.18.2
+  GORELEASER_VERSION: v1.19.2
 
 jobs:
   dependencies:
@@ -26,7 +26,7 @@ jobs:
           go-version-file: .go-version
 
       - name: Set up Clang
-        uses: KyleMayes/install-llvm-action@f8f2154d96f018dcb600739c4978bfc35f435422 # v1.8.1
+        uses: KyleMayes/install-llvm-action@c135b3937686fd69c2651507aabc9925a8f9eee8 # v1.8.3
         with:
           version: "14"
 
@@ -39,12 +39,14 @@ jobs:
         run: git submodule init && git submodule update
 
       - name: Build BPF
-        run: make bpf
+        run: |
+          make ARCH=amd64 bpf
+          make ARCH=arm64 bpf
 
       - uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce # v3.1.2
         with:
           name: ebpf-object-file-release
-          path: pkg/profiler/cpu/cpu-profiler.bpf.o
+          path: bpf/out
           if-no-files-found: error
 
   binaries:
@@ -53,7 +55,7 @@ jobs:
     needs: dependencies
     if: startsWith(github.ref, 'refs/tags/')
     container:
-      image: docker.io/goreleaser/goreleaser-cross:v1.20.5
+      image: docker.io/goreleaser/goreleaser-cross:v1.20.6@sha256:ed6790d7eab29875321ce68a09aaedb42c3bcbde8525b0916bd4601d31157c1b
       options: --privileged
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -81,12 +83,19 @@ jobs:
       - name: Install libbpf dependencies
         run: |
           apt-get update -y
-          apt-get install -yq lld libelf-dev zlib1g-dev libelf-dev:arm64 zlib1g-dev:arm64
+          apt-get install -yq lld libelf-dev zlib1g-dev libelf-dev:arm64 zlib1g-dev:arm64 pkg-config
 
       - uses: actions/download-artifact@9bc31d5ccc31df68ecc42ccf4149144866c47d8a # v3.0.2
         with:
           name: ebpf-object-file-release
-          path: pkg/profiler/cpu/cpu-profiler.bpf.o
+          path: bpf/out
+
+      - name: List downloaded files
+        shell: bash
+        run: |
+          ls -lR bpf
+          mkdir -p pkg/profiler/cpu/bpf
+          cp -r bpf/out/* pkg/profiler/cpu/bpf
 
       - name: Run Goreleaser
         run: goreleaser release --clean --debug
@@ -209,7 +218,7 @@ jobs:
           echo "${{ secrets.PERSONAL_ACCESS_TOKEN }}" | podman login -u parca-dev --password-stdin ghcr.io
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@d13028333d784fcc802b67ec924bcebe75aa0a5f # v3.1.0
+        uses: sigstore/cosign-installer@6e04d228eb30da1757ee4e1dd75a0ec73a653e06 # v3.1.1
 
       - name: Install crane
         if: ${{ github.event_name != 'pull_request' }}
@@ -219,6 +228,7 @@ jobs:
         if: ${{ github.event_name != 'pull_request' }}
         run: |
           make push-container
+          make push-container-latest
 
       - name: Sign container
         run: |

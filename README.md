@@ -60,7 +60,8 @@ Flags:
       --log-level="info"           Log level.
       --log-format="logfmt"        Configure if structured logging as JSON or as
                                    logfmt
-      --http-address=":7071"       Address to bind HTTP server to.
+      --http-address="127.0.0.1:7071"
+                                   Address to bind HTTP server to.
       --version                    Show application version.
       --node="hostname"           The name of the node that the process is
                                    running on. If on Kubernetes, this must match
@@ -70,7 +71,7 @@ Flags:
                                    of memory that may be locked into RAM. It is
                                    used to ensure the agent can lock memory for
                                    eBPF maps. 0 means no limit.
-      --object-file-pool-size=128
+      --object-file-pool-size=512
                                    The maximum number of object files to keep in
                                    the pool. This is used to avoid re-reading
                                    object files from disk. It keeps FDs open,
@@ -120,8 +121,9 @@ Flags:
                                    10s.
       --remote-store-rpc-logging-enable
                                    Enable gRPC logging.
-      --remote-store-rpc-unary-timeout=1m
-                                   Timeout for unary gRPC requests.
+      --remote-store-rpc-unary-timeout=5m
+                                   Maximum timeout window for unary gRPC
+                                   requests including retries.
       --debuginfo-directories=/usr/lib/debug,...
                                    Ordered list of local directories to search
                                    for debuginfo files.
@@ -150,6 +152,8 @@ Flags:
                                    pointers
       --otlp-address=STRING        The endpoint to send OTLP traces to.
       --otlp-exporter="grpc"       The OTLP exporter to use.
+      --analytics-opt-out          Opt out of sending anonymous usage
+                                   statistics.
       --verbose-bpf-logging        Enable verbose BPF logging.
 ```
 

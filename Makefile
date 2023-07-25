@@ -40,7 +40,7 @@ endif
 VERSION ?= $(if $(RELEASE_TAG),$(RELEASE_TAG),$(shell $(CMD_GIT) describe --tags || echo '$(subst /,-,$(BRANCH))$(COMMIT_TIMESTAMP)$(COMMIT)'))
 
 # renovate: datasource=docker depName=docker.io/goreleaser/goreleaser-cross
-GOLANG_CROSS_VERSION := v1.20.5
+GOLANG_CROSS_VERSION := v1.20.6
 
 # inputs and outputs:
 OUT_DIR ?= dist
@@ -59,8 +59,8 @@ LIBBPF_OBJ := $(LIBBPF_DIR)/libbpf.a
 VMLINUX := vmlinux.h
 BPF_ROOT := bpf
 BPF_SRC := $(BPF_ROOT)/cpu/cpu.bpf.c
-OUT_BPF_DIR := pkg/profiler/cpu
-OUT_BPF := $(OUT_BPF_DIR)/cpu-profiler.bpf.o
+OUT_BPF_DIR := pkg/profiler/cpu/bpf/$(ARCH)
+OUT_BPF := $(OUT_BPF_DIR)/cpu.bpf.o
 
 # CGO build flags:
 PKG_CONFIG ?= pkg-config
@@ -142,8 +142,12 @@ test-dwarf-unwind-tables: write-dwarf-unwind-tables
 	$(CMD_GIT) diff --exit-code testdata/
 
 .PHONY: go/deps
-go/deps:
+go/deps: $(GO_SRC)
 	$(GO) mod tidy
+
+.PHONY: go/deps-check
+go/deps-check: go/deps
+	$(GO_ENV) CGO_CFLAGS="$(CGO_CFLAGS_DYN)" CGO_LDFLAGS="$(CGO_LDFLAGS_DYN)" govulncheck ./...
 
 # bpf build:
 .PHONY: bpf
@@ -153,7 +157,7 @@ ifndef DOCKER
 $(OUT_BPF): $(BPF_SRC) libbpf | $(OUT_DIR)
 	mkdir -p $(OUT_BPF_DIR)
 	$(MAKE) -C bpf build
-	cp bpf/cpu/cpu.bpf.o $(OUT_BPF)
+	cp bpf/out/$(ARCH)/cpu.bpf.o $(OUT_BPF)
 else
 $(OUT_BPF): $(DOCKER_BUILDER) | $(OUT_DIR)
 	$(call docker_builder_make,$@)
@@ -192,12 +196,14 @@ check-license:
 	./scripts/check-license.sh
 
 .PHONY: go/lint
-go/lint:
+go/lint: go/deps-check
+	mkdir -p $(OUT_BPF_DIR)
 	touch $(OUT_BPF)
 	$(GO_ENV) $(CGO_ENV) golangci-lint run
 
 .PHONY: go/lint-fix
 go/lint-fix:
+	mkdir -p $(OUT_BPF_DIR)
 	touch $(OUT_BPF)
 	$(GO_ENV) $(CGO_ENV) golangci-lint run --fix
 
@@ -270,6 +276,9 @@ clean: mostlyclean
 	-rm -f kerneltest/cpu.test
 	-rm -f kerneltest/logs/vm_log_*.txt
 	-rm -f kerneltest/kernels/linux-*.bz
+	-rm -rf pkg/profiler/cpu/bpf/
+	-rm -rf dist/
+	-rm -rf goreleaser/dist/
 
 # container:
 .PHONY: container
@@ -295,6 +304,10 @@ sign-container:
 .PHONY: push-container
 push-container:
 	podman manifest push --all $(OUT_DOCKER):$(VERSION) docker://$(OUT_DOCKER):$(VERSION)
+
+.PHONY: push-container-latest
+push-container-latest:
+	podman manifest push --all $(OUT_DOCKER):$(VERSION) docker://$(OUT_DOCKER):latest
 
 .PHONY: push-signed-quay-container
 push-signed-quay-container:

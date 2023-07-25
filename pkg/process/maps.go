@@ -135,7 +135,8 @@ func (mm *MapManager) MappingsForPID(pid int) (Mappings, error) {
 	for _, m := range maps {
 		mapping, err := mm.newUserMapping(m, pid)
 		if err != nil {
-			if errors.Is(err, &elf.FormatError{}) {
+			var elfErr *elf.FormatError
+			if errors.As(err, &elfErr) {
 				// We don't want to count these as errors. This just means the file
 				// is not an ELF file.
 				continue
@@ -184,6 +185,12 @@ type Mapping struct {
 	baseSet  bool
 	baseErr  error
 
+	IsJitDump bool
+
+	// This mapping had no path associated with it. Usually this means the
+	// mapping is a JIT compiled section.
+	NoFileMapping bool
+
 	containsDebuginfoToUpload bool
 }
 
@@ -199,14 +206,22 @@ func (mm *MapManager) newUserMapping(pm *procfs.ProcMap, pid int) (*Mapping, err
 	}
 
 	if !m.isSymbolizable() { // No need to open/initialize unsymbolizable mappings.
+		if m.Pathname == "" {
+			m.NoFileMapping = true
+		}
 		m.containsDebuginfoToUpload = false
 		return m, nil
 	}
 
 	obj, err := m.mm.objFilePool.Open(m.AbsolutePath())
 	if err != nil {
-		if !errors.Is(err, &elf.FormatError{}) {
+		var elfErr *elf.FormatError
+		// This magic number is the magic number for JITDump files.
+		if errors.As(err, &elfErr) && elfErr.Error() == "bad magic number '[68 84 105 74]' in record at byte 0x0" {
 			m.containsDebuginfoToUpload = false
+			m.IsJitDump = true
+
+			return m, nil
 		}
 		return nil, fmt.Errorf("failed to open mapped object file: %w", err)
 	}

@@ -50,7 +50,7 @@ jobs:
           go-version-file: .go-version
 
       - name: Set up Clang
-        uses: KyleMayes/install-llvm-action@f8f2154d96f018dcb600739c4978bfc35f435422 # v1.8.1
+        uses: KyleMayes/install-llvm-action@c135b3937686fd69c2651507aabc9925a8f9eee8 # v1.8.3
         with:
           version: "14"
 

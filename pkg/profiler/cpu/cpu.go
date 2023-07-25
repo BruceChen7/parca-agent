@@ -19,10 +19,11 @@ import "C" //nolint:all
 import (
 	"bytes"
 	"context"
-	_ "embed"
+	"embed"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"runtime"
@@ -40,7 +41,10 @@ import (
 	"github.com/puzpuzpuz/xsync/v2"
 	"golang.org/x/sys/unix"
 
+	"github.com/parca-dev/parca-agent/pkg/buildid"
 	"github.com/parca-dev/parca-agent/pkg/byteorder"
+	"github.com/parca-dev/parca-agent/pkg/cache"
+	"github.com/parca-dev/parca-agent/pkg/cpuinfo"
 	"github.com/parca-dev/parca-agent/pkg/metadata/labels"
 	"github.com/parca-dev/parca-agent/pkg/pprof"
 	"github.com/parca-dev/parca-agent/pkg/profile"
@@ -50,8 +54,8 @@ import (
 )
 
 var (
-	//go:embed cpu-profiler.bpf.o
-	bpfObj []byte
+	//go:embed bpf/*
+	bpfObjects embed.FS
 
 	cpuProgramFd = uint64(0)
 )
@@ -98,6 +102,7 @@ type CPU struct {
 
 	lastError                      error
 	processLastErrors              map[int]error
+	processErrorTracker            *cache.LRUCache[string, int]
 	lastSuccessfulProfileStartedAt time.Time
 	lastProfileStartedAt           time.Time
 
@@ -156,6 +161,9 @@ func NewCPUProfiler(
 
 		memlockRlimit: memlockRlimit,
 
+		// increase cache length if needed to track more errors
+		processErrorTracker: cache.NewLRUCache[string, int](prometheus.WrapRegistererWith(prometheus.Labels{"cache": "no_text_section_error_tracker"}, reg), 512),
+
 		debugProcessNames: debugProcessNames,
 
 		dwarfUnwindingDisable: disableDWARFUnwinding,
@@ -194,7 +202,7 @@ func (p *CPU) debugProcesses() bool {
 
 // loadBpfProgram loads the BPF program and maps adjusting the unwind shards to
 // the highest possible value.
-func loadBpfProgram(logger log.Logger, reg prometheus.Registerer, mixedUnwinding, debugEnabled, verboseBpfLogging bool, memlockRlimit uint64) (*bpf.Module, *bpfMaps, error) {
+func loadBpfProgram(logger log.Logger, reg prometheus.Registerer, mixedUnwinding, debugEnabled, dwarfUnwindDisabled, verboseBpfLogging bool, memlockRlimit uint64) (*bpf.Module, *bpfMaps, error) {
 	var lerr error
 
 	maxLoadAttempts := 10
@@ -205,6 +213,18 @@ func loadBpfProgram(logger log.Logger, reg prometheus.Registerer, mixedUnwinding
 			level.Debug(logger).Log("msg", msg)
 		},
 	})
+
+	f, err := bpfObjects.Open(fmt.Sprintf("bpf/%s/cpu.bpf.o", runtime.GOARCH))
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to open BPF object: %w", err)
+	}
+	// Note: no need to close this file, it's a virtual file from embed.FS, for
+	// which Close is a no-op.
+
+	bpfObj, err := io.ReadAll(f)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read BPF object: %w", err)
+	}
 
 	// Adaptive unwind shard count sizing.
 	for i := 0; i < maxLoadAttempts; i++ {
@@ -227,6 +247,13 @@ func loadBpfProgram(logger log.Logger, reg prometheus.Registerer, mixedUnwinding
 		bpfMaps, err := initializeMaps(logger, reg, m, binary.LittleEndian)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to initialize eBPF maps: %w", err)
+		}
+
+		if dwarfUnwindDisabled {
+			// Even if DWARF-based unwinding is disabled, either due to the user passing the flag to disable it or running on arm64, still
+			// create a handful of shards to ensure that when it is enabled we can at least create some shards. Basically we want to ensure
+			// that we catch any potential issues as early as possible.
+			unwindShards = uint32(5)
 		}
 
 		level.Info(logger).Log("msg", "Attempting to create unwind shards", "count", unwindShards)
@@ -263,7 +290,7 @@ func (p *CPU) addUnwindTableForProcess(pid int) {
 	if err != nil {
 		// It might not exist as reading procfs is racy.
 		if !errors.Is(err, os.ErrNotExist) {
-			level.Error(p.logger).Log("msg", "frame pointer detection failed", "executable", executable, "err", err)
+			level.Debug(p.logger).Log("msg", "frame pointer detection failed", "executable", executable, "err", err)
 		}
 		return
 	}
@@ -283,6 +310,19 @@ func (p *CPU) addUnwindTableForProcess(pid int) {
 			level.Debug(p.logger).Log("msg", "failed to add unwind table due to a procfs race", "pid", pid, "err", err)
 		} else if errors.Is(err, errTooManyExecutableMappings) {
 			level.Warn(p.logger).Log("msg", "failed to add unwind table due to having too many executable mappings", "pid", pid, "err", err)
+		} else if errors.Is(err, buildid.ErrTextSectionNotFound) {
+			v, ok := p.processErrorTracker.Peek(err.Error())
+			if ok {
+				p.processErrorTracker.Add(err.Error(), v+1)
+			} else {
+				p.processErrorTracker.Add(err.Error(), 1)
+			}
+			v, _ = p.processErrorTracker.Get(err.Error())
+			if v%50 == 0 || v == 1 {
+				level.Error(p.logger).Log("msg", "failed to add unwind table due to unavailable .text section", "pid", pid, "err", err, "encounters", v)
+			} else {
+				level.Debug(p.logger).Log("msg", "failed to add unwind table due to unavailable .text section", "pid", pid, "err", err, "encounters", v)
+			}
 		} else {
 			level.Error(p.logger).Log("msg", "failed to add unwind table", "pid", pid, "err", err)
 		}
@@ -349,6 +389,9 @@ func (p *CPU) listenEvents(ctx context.Context, eventsChan <-chan []byte, lostCh
 			pid := int(int32(payload))
 			switch {
 			case payload&RequestUnwindInformation == RequestUnwindInformation:
+				if p.dwarfUnwindingDisable {
+					continue
+				}
 				// See onDemandUnwindInfoBatcher for consumer.
 				requestUnwindInfoChan <- pid
 			case payload&RequestProcessMappings == RequestProcessMappings:
@@ -448,7 +491,7 @@ func (p *CPU) Run(ctx context.Context) error {
 
 	debugEnabled := len(matchers) > 0
 
-	m, bpfMaps, err := loadBpfProgram(p.logger, p.reg, p.mixedUnwinding, debugEnabled, p.bpfLoggingVerbose, p.memlockRlimit)
+	m, bpfMaps, err := loadBpfProgram(p.logger, p.reg, p.mixedUnwinding, debugEnabled, p.dwarfUnwindingDisable, p.bpfLoggingVerbose, p.memlockRlimit)
 	if err != nil {
 		return fmt.Errorf("load bpf program: %w", err)
 	}
@@ -469,7 +512,7 @@ func (p *CPU) Run(ctx context.Context) error {
 	// By default we sample at 19Hz (19 times per second),
 	// which is every ~0.05s or 52,631,578 nanoseconds (1 Hz = 1e9 ns).
 	samplingPeriod := int64(1e9 / p.profilingSamplingFrequency)
-	cpus := runtime.NumCPU()
+	cpus := cpuinfo.NumCPU()
 
 	for i := 0; i < cpus; i++ {
 		fd, err := unix.PerfEventOpen(&unix.PerfEventAttr{
@@ -594,20 +637,38 @@ func (p *CPU) Run(ctx context.Context) error {
 		p.metrics.obtainAttempts.WithLabelValues(labelSuccess).Inc()
 		p.metrics.obtainDuration.Observe(time.Since(obtainStart).Seconds())
 
+		groupedRawData := make(map[int]profile.ProcessRawData)
+		for _, perThreadRawData := range rawData {
+			pid := int(perThreadRawData.PID)
+			data, ok := groupedRawData[pid]
+			if !ok {
+				groupedRawData[pid] = profile.ProcessRawData{
+					PID:        perThreadRawData.PID,
+					RawSamples: perThreadRawData.RawSamples,
+				}
+				continue
+			}
+
+			groupedRawData[pid] = profile.ProcessRawData{
+				PID:        perThreadRawData.PID,
+				RawSamples: append(data.RawSamples, perThreadRawData.RawSamples...),
+			}
+		}
+
 		processLastErrors := map[int]error{}
-		for _, perProcessRawData := range rawData {
-			pid := int(perProcessRawData.PID)
+		for pid, perProcessRawData := range groupedRawData {
 			processLastErrors[pid] = nil
 
 			pi, err := p.processInfoManager.Info(ctx, pid)
 			if err != nil {
 				p.metrics.profileDrop.WithLabelValues(profileDropReasonProcessInfo).Inc()
-				level.Warn(p.logger).Log("msg", "failed to get process info", "pid", pid, "err", err)
+				level.Debug(p.logger).Log("msg", "failed to get process info", "pid", pid, "err", err)
 				processLastErrors[pid] = err
 				continue
 			}
 
 			pprof, err := p.profileConverter.NewConverter(
+				pfs,
 				pid,
 				pi.Mappings.ExecutableSections(),
 				p.LastProfileStartedAt(),
@@ -741,7 +802,7 @@ type (
 	// TODO(https://github.com/parca-dev/parca-agent/issues/207)
 	stackCountKey struct {
 		PID              int32
-		TGID             int32
+		TID              int32
 		UserStackID      int32
 		KernelStackID    int32
 		UserStackIDDWARF int32
@@ -752,9 +813,14 @@ func (s *stackCountKey) walkedWithDwarf() bool {
 	return s.UserStackIDDWARF != 0
 }
 
+type profileKey struct {
+	pid int32
+	tid int32
+}
+
 // obtainProfiles collects profiles from the BPF maps.
 func (p *CPU) obtainRawData(ctx context.Context) (profile.RawData, error) {
-	rawData := map[int32]map[combinedStack]uint64{}
+	rawData := map[profileKey]map[combinedStack]uint64{}
 
 	it := p.bpfMaps.stackCounts.Iterator()
 	for it.Next() {
@@ -774,7 +840,8 @@ func (p *CPU) obtainRawData(ctx context.Context) (profile.RawData, error) {
 			return nil, fmt.Errorf("read stack count key: %w", err)
 		}
 
-		pid := key.PID
+		// Profile aggregation key.
+		pKey := profileKey{pid: key.PID, tid: key.TID}
 
 		// Twice the stack depth because we have a user and a potential Kernel stack.
 		// Read order matters, since we read from the key buffer.
@@ -854,14 +921,14 @@ func (p *CPU) obtainRawData(ctx context.Context) (profile.RawData, error) {
 			continue
 		}
 
-		perProcessData, ok := rawData[pid]
+		perThreadData, ok := rawData[pKey]
 		if !ok {
 			// We haven't seen this id yet.
-			perProcessData = map[combinedStack]uint64{}
-			rawData[pid] = perProcessData
+			perThreadData = map[combinedStack]uint64{}
+			rawData[pKey] = perThreadData
 		}
 
-		perProcessData[stack] += value
+		perThreadData[stack] += value
 	}
 	if it.Err() != nil {
 		p.metrics.stackDrop.WithLabelValues(labelStackDropReasonIterator).Inc()
@@ -880,15 +947,15 @@ func (p *CPU) obtainRawData(ctx context.Context) (profile.RawData, error) {
 // stacks. Since the input data is a map of maps, we can assume that they're
 // already unique and there are no duplicates, which is why at this point we
 // can just transform them into plain slices and structs.
-func preprocessRawData(rawData map[int32]map[combinedStack]uint64) profile.RawData {
+func preprocessRawData(rawData map[profileKey]map[combinedStack]uint64) profile.RawData {
 	res := make(profile.RawData, 0, len(rawData))
-	for pid, perProcessRawData := range rawData {
+	for pKey, perThreadRawData := range rawData {
 		p := profile.ProcessRawData{
-			PID:        profile.PID(pid),
-			RawSamples: make([]profile.RawSample, 0, len(perProcessRawData)),
+			PID:        profile.PID(pKey.pid),
+			RawSamples: make([]profile.RawSample, 0, len(perThreadRawData)),
 		}
 
-		for stack, count := range perProcessRawData {
+		for stack, count := range perThreadRawData {
 			kernelStackDepth := 0
 			userStackDepth := 0
 
@@ -913,6 +980,7 @@ func preprocessRawData(rawData map[int32]map[combinedStack]uint64) profile.RawDa
 			copy(kernelStack, stack[stackDepth:stackDepth+kernelStackDepth])
 
 			p.RawSamples = append(p.RawSamples, profile.RawSample{
+				TID:         profile.PID(pKey.tid),
 				UserStack:   userStack,
 				KernelStack: kernelStack,
 				Value:       count,
