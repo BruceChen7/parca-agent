@@ -58,7 +58,7 @@ func Java(logger log.Logger, nsCache *namespace.Cache) Provider {
 }
 
 func getJavaVersion(ctx context.Context, pid int) (string, error) {
-	cmd := exec.CommandContext(ctx, "nsenter", "-t", strconv.Itoa(pid), "--mount", "--pid", fmt.Sprintf("/proc/%d/exe", pid), "-version")
+	cmd := exec.CommandContext(ctx, "nsenter", "-t", strconv.Itoa(pid), "--mount", "--pid", fmt.Sprintf("/proc/%d/exe", pid), "-version") //nolint:gosec
 	b := &bytes.Buffer{}
 	cmd.Stdout = b
 	err := cmd.Run()
