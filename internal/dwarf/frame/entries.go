@@ -27,11 +27,13 @@ type CommonInformationEntry struct {
 // FrameDescriptionEntry represents a Frame Descriptor Entry in the
 // Dwarf .debug_frame section.
 type FrameDescriptionEntry struct {
-	Length       uint32
+	Length uint32
+	// 所属的CIE
 	CIE          *CommonInformationEntry
 	Instructions []byte
-	begin, size  uint64
-	order        binary.ByteOrder
+	// begin是开始的pc地址，
+	begin, size uint64
+	order       binary.ByteOrder
 }
 
 // Cover returns whether or not the given address is within the
@@ -56,6 +58,7 @@ func (fde *FrameDescriptionEntry) Translate(delta uint64) {
 	fde.begin += delta
 }
 
+// 栈帧描述entries
 type FrameDescriptionEntries []*FrameDescriptionEntry
 
 func (t FrameDescriptionEntries) Len() int           { return len(t) }

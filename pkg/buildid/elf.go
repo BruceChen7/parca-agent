@@ -29,6 +29,7 @@ const goBuildIDSectionName = ".note.go.buildid"
 var ErrTextSectionNotFound = errors.New("could not find .text section")
 
 // FromELF returns the build ID for an ELF binary.
+// 获取从文件写入的buildid
 func FromELF(ef *elf.File) (string, error) {
 	// First, try fast methods.
 	hasGoBuildIDSection := false

@@ -27,6 +27,7 @@ import (
 var rlimitMu sync.Mutex
 
 // BumpMemlock increases the current memlock limit to a value more reasonable for the profiler's needs.
+// 用来给ebpf 程序增大内存限制
 func BumpMemlock(cur, max uint64) (syscall.Rlimit, error) {
 	rLimit := syscall.Rlimit{
 		Cur: cur, // Soft limit.

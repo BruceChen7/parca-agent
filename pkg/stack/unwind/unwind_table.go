@@ -144,6 +144,8 @@ func (ptb *UnwindTableBuilder) PrintTable(writer io.Writer, path string, compact
 	return nil
 }
 
+// 怎么使用？
+// 直接调用ReadFDEs，传入二进制文件路径
 func ReadFDEs(path string) (frame.FrameDescriptionEntries, error) {
 	// TODO(kakkoyun): Migrate objectfile and pool.
 	obj, err := elf.Open(path)
@@ -165,8 +167,7 @@ func ReadFDEs(path string) (frame.FrameDescriptionEntries, error) {
 	}
 
 	// TODO: Byte order of a DWARF section can be different.
-	// 字节序列
-	// 指针大小
+	// 返回fde
 	fdes, err := frame.Parse(ehFrame, obj.ByteOrder, 0, pointerSize(obj.Machine), sec.Addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse frame data: %w", err)
@@ -179,6 +180,7 @@ func ReadFDEs(path string) (frame.FrameDescriptionEntries, error) {
 	return fdes, nil
 }
 
+// 返回展开表
 func BuildUnwindTable(fdes frame.FrameDescriptionEntries) UnwindTable {
 	// The frame package can raise in case of malformed unwind data.
 	table := make(UnwindTable, 0, 4*len(fdes)) // heuristic

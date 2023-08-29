@@ -182,6 +182,7 @@ func clearBpfMap(bpfMap *bpf.BPFMap) error {
 	return nil
 }
 
+// 定义bpfMaps
 type bpfMaps struct {
 	logger log.Logger
 
@@ -556,6 +557,7 @@ func (m *bpfMaps) refreshProcessInfo(pid int) {
 	}
 
 	if cachedHash != currentHash {
+		// 添加进程的展开表
 		err := m.addUnwindTableForProcess(pid, executableMappings, false)
 		if err != nil {
 			level.Error(m.logger).Log("msg", "addUnwindTableForProcess failed", "err", err)
@@ -943,6 +945,7 @@ func (m *bpfMaps) setUnwindTableForMapping(buf *profiler.EfficientBuffer, pid in
 
 	// Deal with mappings that are backed by a file and might contain unwind
 	// information.
+	// 获取该进程指定的文件目录
 	fullExecutablePath := path.Join("/proc/", fmt.Sprintf("%d", pid), "/root/", mapping.Executable)
 
 	f, err := os.Open(fullExecutablePath)
@@ -956,6 +959,7 @@ func (m *bpfMaps) setUnwindTableForMapping(buf *profiler.EfficientBuffer, pid in
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
+		// 如果不是elf文件，则吞掉错误
 		if errors.As(err, &elfErr) {
 			level.Debug(m.logger).Log("msg", "bad ELF file format", "err", err)
 			return nil
@@ -970,7 +974,11 @@ func (m *bpfMaps) setUnwindTableForMapping(buf *profiler.EfficientBuffer, pid in
 	// Find the adjusted load address.
 	aslrElegible := elfreader.IsASLRElegibleElf(ef)
 
+	// 默认是0
 	adjustedLoadAddress := uint64(0)
+	// is main opject
+	// IsMainObject函数判断此可执行文件是否为“主可执行文件”。
+	// 从而触发加载所有其他映射文件。
 	if mapping.IsMainObject() {
 		level.Debug(m.logger).Log("msg", "dealing with main object", "mapping", mapping)
 
@@ -978,6 +986,7 @@ func (m *bpfMaps) setUnwindTableForMapping(buf *profiler.EfficientBuffer, pid in
 			adjustedLoadAddress = mapping.LoadAddr
 		}
 	} else {
+		// 获取mapping对应的地址
 		adjustedLoadAddress = mapping.LoadAddr
 	}
 
@@ -996,8 +1005,10 @@ func (m *bpfMaps) setUnwindTableForMapping(buf *profiler.EfficientBuffer, pid in
 		// Generate the unwind table.
 		// PERF(javierhonduco): Not reusing a buffer here yet, let's profile and decide whether this
 		// change would be worth it.
+		// 展开unwind表
 		ut, err := m.generateCompactUnwindTable(fullExecutablePath, mapping)
 		if err != nil {
+			// 没有找到
 			if errors.Is(err, unwind.ErrNoFDEsFound) {
 				// is it ok to return here?
 				return nil
@@ -1009,6 +1020,7 @@ func (m *bpfMaps) setUnwindTableForMapping(buf *profiler.EfficientBuffer, pid in
 			return nil
 		}
 
+		// 没有相关的frame description entry
 		if len(ut) == 0 {
 			return nil
 		}
@@ -1020,6 +1032,7 @@ func (m *bpfMaps) setUnwindTableForMapping(buf *profiler.EfficientBuffer, pid in
 			restChunks   unwind.CompactUnwindTable
 		)
 
+		// 剩余的部分
 		restChunks = ut
 
 		for {

@@ -42,7 +42,9 @@ import (
 // Note(javierhonduco): This check is a bit simplistic and might not work
 // for every case. We might want to check across multiple kernels. It probably
 // won't be correct for the dynamic loader itself. See link above.
+// 可执行文件是否适合进行地址空间布局随机化
 func IsASLRElegibleElf(elfFile *elf.File) bool {
+	// 如果是动态链接程序，是可以进行随机化的
 	return elfFile.FileHeader.Type == elf.ET_DYN
 }
 

@@ -29,8 +29,10 @@ var seed = maphash.MakeSeed()
 
 // ExecutableMapping represents an executable memory mapping.
 type ExecutableMapping struct {
-	LoadAddr   uint64
-	StartAddr  uint64
+	LoadAddr uint64
+	// 内存映射的开始地址和结束地址
+	StartAddr uint64
+	// 结束地址
 	EndAddr    uint64
 	Executable string
 	mainExec   bool
@@ -123,6 +125,14 @@ func executableMappingCount(rawMappings []*procfs.ProcMap) uint {
 // sections without executable permissions, as they aren't needed.
 //
 // Note: jitdump files are typically executable but are excluded from the results.
+// 获取可执行的内存映射
+// ExecutableMappings函数返回具有适当加载基地址的可执行内存映射，适用于非JIT代码。
+//
+// 我们需要查找加载的基地址的原因是，ELF可执行文件通常不会在一个大的可执行段中加载，
+// 而是分成多个映射。例如，.rodata段以及.eh_frame可能位于没有可执行权限的段中，因为它们不是必需的。
+//
+// 注意：jitdump文件通常是可执行的，但在结果中被排除在外。
+
 func ListExecutableMappings(rawMappings []*procfs.ProcMap) ExecutableMappings {
 	result := make([]*ExecutableMapping, 0, executableMappingCount(rawMappings))
 	firstSeen := false
@@ -142,9 +152,10 @@ func ListExecutableMappings(rawMappings []*procfs.ProcMap) ExecutableMappings {
 			}
 
 			mapping := ExecutableMapping{
-				LoadAddr:   loadAddr,
-				StartAddr:  uint64(rawMapping.StartAddr),
-				EndAddr:    uint64(rawMapping.EndAddr),
+				LoadAddr:  loadAddr,
+				StartAddr: uint64(rawMapping.StartAddr),
+				EndAddr:   uint64(rawMapping.EndAddr),
+				// 这里执行写路径
 				Executable: rawMapping.Pathname,
 				mainExec:   !firstSeen,
 			}

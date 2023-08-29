@@ -295,6 +295,7 @@ func (p *CPU) addUnwindTableForProcess(pid int) {
 		return
 	}
 
+	// 存在frame pointer
 	if hasFramePointers {
 		return
 	}
@@ -469,6 +470,7 @@ func bpfCheck() error {
 	return result
 }
 
+// cpu profile
 func (p *CPU) Run(ctx context.Context) error {
 	level.Debug(p.logger).Log("msg", "starting cpu profiler")
 

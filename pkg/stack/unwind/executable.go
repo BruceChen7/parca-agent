@@ -97,12 +97,14 @@ func NewHasFramePointersCache(logger log.Logger, reg prometheus.Registerer) Fram
 
 func HasFramePointers(executable string) (bool, error) {
 	// TODO(kakkoyun): Migrate objectfile and pool.
+	// 打开二进制文件
 	f, err := elf.Open(executable)
 	if err != nil {
 		return false, fmt.Errorf("failed to open ELF file for path %s: %w", executable, err)
 	}
 	defer f.Close()
 
+	// 用来获取二进制版本
 	compiler := ainur.Compiler(f)
 	// Go 1.7 [0] enabled FP for x86_64. arm64 got them enabled in 1.12 [1].
 	//
