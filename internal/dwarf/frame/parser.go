@@ -72,8 +72,11 @@ func (ctx *parseContext) offset() int {
 // .eh_frame部分是一连串的记录。
 // 每条记录是一个CIE（通用信息条目）或FDE（帧描述条目）。
 // 一般来说，每个对象文件有一个CIE，每个CIE都与一个FDE列表相关
-// 每个FDE通常与一个函数相关联。CIE和FDE一起描述了如果当前指令指针在FDE覆盖的范围内，如何向调用者解压。
+// 每个FDE通常与一个函数相关联。
+// CIE和FDE一起描述了如果当前指令指针在FDE覆盖的范围内，如何向调用者解压。
+// [Exception Frames](https://refspecs.linuxfoundation.org/LSB_4.1.0/LSB-Core-generic/LSB-Core-generic/ehframechpt.html)
 func parselength(ctx *parseContext) parsefunc {
+	// 开始解释的开始地址
 	start := ctx.offset()
 	// 小端字节序
 	// 第一个4字节是长度
@@ -84,8 +87,10 @@ func parselength(ctx *parseContext) parsefunc {
 		panic("Could not read from buffer")
 	}
 
+	// 是终止符，表示结束
 	if ctx.length == 0 {
 		// ZERO terminator
+		// 开始下一个CIE
 		return parselength
 	}
 
@@ -106,7 +111,7 @@ func parselength(ctx *parseContext) parsefunc {
 		ctx.common = &CommonInformationEntry{Length: ctx.length, staticBase: ctx.staticBase, CIE_id: cieid}
 		// 设置CIE信息
 		ctx.ciemap[start] = ctx.common
-		// 下一步用来parse
+		// 下一步用来parse CIE信息
 		return parseCIE
 	}
 
@@ -115,6 +120,7 @@ func parselength(ctx *parseContext) parsefunc {
 		cieid = uint32(start - int(cieid) + 4)
 	}
 
+	// 是一个FDE
 	common := ctx.ciemap[int(cieid)]
 
 	if common == nil {
@@ -178,6 +184,7 @@ func addrSum(base uint64, buf *bytes.Reader) uint64 {
 
 // 用来parse CommonInformationEntry
 func parseCIE(ctx *parseContext) parsefunc {
+	// 获取CIE的数据
 	data := ctx.buf.Next(int(ctx.length))
 	buf := bytes.NewBuffer(data)
 	// parse version
@@ -189,7 +196,7 @@ func parseCIE(ctx *parseContext) parsefunc {
 	ctx.common.Augmentation, _ = util.ParseString(buf)
 
 	if ctx.parsingEHFrame() {
-		// 比较老的gcc版本才是孙
+		// 比较老的gcc版本才eh
 		if ctx.common.Augmentation == "eh" {
 			ctx.err = fmt.Errorf("unsupported 'eh' augmentation at %#x", ctx.offset())
 		}
@@ -220,6 +227,7 @@ func parseCIE(ctx *parseContext) parsefunc {
 	if ctx.parsingEHFrame() && len(ctx.common.Augmentation) > 0 {
 		// 获取无符号LEB128的数据
 		_, _ = util.DecodeULEB128(buf) // augmentation data length
+		// 第一个必须是z
 		for i := 1; i < len(ctx.common.Augmentation); i++ {
 			switch ctx.common.Augmentation[i] {
 			// 增量字符串是L
@@ -228,6 +236,7 @@ func parseCIE(ctx *parseContext) parsefunc {
 				_, _ = buf.ReadByte() // LSDA pointer encoding, we don't support this.
 			case 'R':
 				// Pointer encoding, describes how begin and size fields of FDEs are encoded.
+				// 获取指针编码
 				b, _ := buf.ReadByte()
 				// 那么下一个字节是FDE编码
 				ctx.common.ptrEncAddr = ptrEnc(b)
@@ -265,6 +274,7 @@ func parseCIE(ctx *parseContext) parsefunc {
 	// so we can just grab all of the data from the buffer
 	// cursor to length.
 	// 下一次要parse的Instructions
+	// 是FDE或CIE
 	ctx.common.InitialInstructions = buf.Bytes() // ctx.buf.Next(int(ctx.length))
 	ctx.length = 0
 

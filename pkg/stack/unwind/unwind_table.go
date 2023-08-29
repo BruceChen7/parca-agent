@@ -161,6 +161,8 @@ func ReadFDEs(path string) (frame.FrameDescriptionEntries, error) {
 
 	// TODO: Consider using the debug_frame section as a fallback.
 	// TODO: Needs to support DWARF64 as well.
+	// 这里.debug_frame和.eh_frame是类似的
+	// (https://refspecs.linuxfoundation.org/LSB_4.1.0/LSB-Core-generic/LSB-Core-generic/ehframechpt.html)
 	ehFrame, err := sec.Data()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read .eh_frame section: %w", err)
