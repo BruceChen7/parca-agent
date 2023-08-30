@@ -31,10 +31,12 @@ const (
 	X86_64StackPointer = 7 // $rsp
 )
 
+// 展开的寄存器抽象
 type UnwindRegisters struct {
 	StackPointer DWRule
 	FramePointer DWRule
-	SavedReturn  DWRule
+	// 返回地址
+	SavedReturn DWRule
 }
 
 // DWRule wrapper of rule defined for register values.
@@ -48,7 +50,9 @@ type DWRule struct {
 // InstructionContext represents each object code instruction
 // that we have unwind information for.
 type InstructionContext struct {
-	loc           uint64
+	// 位置
+	loc uint64
+	// cfa 规则
 	CFA           DWRule
 	Regs          UnwindRegisters
 	initialRegs   UnwindRegisters
@@ -75,6 +79,7 @@ func (ici *InstructionContextIterator) HasNext() bool {
 func (ici *InstructionContextIterator) Next() *InstructionContext {
 	for ici.ctx.buf.Len() > 0 {
 		lastPcBefore := ici.ctx.lastInsCtx.loc
+		// 执行dwarf指令
 		executeDwarfInstruction(ici.ctx)
 		lastPcAfter := ici.ctx.lastInsCtx.loc
 		// We are at an instruction boundary when there's a program counter change.
@@ -255,6 +260,7 @@ func executeCIEInstructions(cie *CommonInformationEntry, context *Context) *Cont
 		context = NewContext()
 	}
 
+	// 设置Common Information Entry 到context
 	context.reset(cie)
 	context.executeDwarfProgram()
 	return context
@@ -290,6 +296,7 @@ func executeDwarfInstruction(ctx *Context) {
 		panic("Could not read from instruction buffer")
 	}
 
+	// 如果是nop指令，那么直接返回
 	if instruction == DW_CFA_nop {
 		return
 	}

@@ -224,9 +224,13 @@ func unwindTableRow(instructionContext *frame.InstructionContext) *UnwindTableRo
 	}
 
 	return &UnwindTableRow{
+		// 位置
 		Loc: instructionContext.Loc(),
+		// CFA
 		CFA: instructionContext.CFA,
-		RA:  instructionContext.Regs.SavedReturn,
+		// return address register
+		RA: instructionContext.Regs.SavedReturn,
+		// rbp address register
 		RBP: instructionContext.Regs.FramePointer,
 	}
 }

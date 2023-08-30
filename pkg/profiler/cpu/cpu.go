@@ -353,6 +353,7 @@ func (p *CPU) listenEvents(ctx context.Context, eventsChan <-chan []byte, lostCh
 		fetchInProgress   = xsync.NewIntegerMapOf[int, struct{}]()
 		refreshInProgress = xsync.NewIntegerMapOf[int, struct{}]()
 	)
+	// 启动个多个协程来处理
 	for i := 0; i < p.perfEventBufferWorkerCount; i++ {
 		go func() {
 			for {
@@ -384,6 +385,7 @@ func (p *CPU) listenEvents(ctx context.Context, eventsChan <-chan []byte, lostCh
 				continue
 			}
 
+			// 小端数据
 			payload := binary.LittleEndian.Uint64(receivedBytes)
 			// Get the 4 more significant bytes and convert to int as they are different types.
 			// On x86_64:
@@ -391,16 +393,21 @@ func (p *CPU) listenEvents(ctx context.Context, eventsChan <-chan []byte, lostCh
 			//	- unsafe.Sizeof(uint32(0)) = 4
 			pid := int(int32(payload))
 			switch {
+			// 请求获取展开表信息
 			case payload&RequestUnwindInformation == RequestUnwindInformation:
+				// 什么都不处理
 				if p.dwarfUnwindingDisable {
 					continue
 				}
 				// See onDemandUnwindInfoBatcher for consumer.
+				// 用来获取
 				requestUnwindInfoChan <- pid
+			// 请求获取mapping信息
 			case payload&RequestProcessMappings == RequestProcessMappings:
 				if _, exists := fetchInProgress.LoadOrStore(pid, struct{}{}); exists {
 					continue
 				}
+				// 用来处理pid信息
 				prefetch <- pid
 			case payload&RequestRefreshProcInfo == RequestRefreshProcInfo:
 				// Refresh mappings and their unwind info if they've changed.
@@ -419,6 +426,13 @@ func (p *CPU) listenEvents(ctx context.Context, eventsChan <-chan []byte, lostCh
 		}
 	}
 }
+
+// onDemandUnwindInfoBatcher从BPF程序中批处理发送的PID，
+// 当没有帧指针和解扣信息时。
+//
+// 等待duration一段时间很重要，因为必须调用PersistUnwindTable
+// 来将正在飞行中的分片写入BPF映射。在我们在Demo中进行CPU配置文件时，
+// 当我们在添加每个pid后持续保留展开表，这一直是一个热点路径。
 
 // onDemandUnwindInfoBatcher batches PIDs sent from the BPF program when
 // frame pointers and unwind information are not present.
@@ -440,15 +454,22 @@ func onDemandUnwindInfoBatcher(ctx context.Context, eventsChannel <-chan int, du
 			// no other deadline in progress. During this time period we'll batch
 			// all the events received. Once time's up, we will pass the batch to
 			// the callback.
+			// 每当接收到事件时，希望在没有其他进行中的截止日期的情况下设置截止日期。
+			// 在此时间段内，我们将批处理接收到的所有事件。
+			// 一旦时间到达，我们将把批处理传递给回调函数。
 			if !timerOn {
 				timerOn = true
 				timer = time.NewTimer(duration)
 			}
 			batch = append(batch, pid)
 		case <-timer.C:
+			// 到时间了，执行指定的回调函数
 			callback(batch)
+			// 清空batch
 			batch = batch[:0]
+			// 没有打开
 			timerOn = false
+			// 停止计时
 			timer.Stop()
 		}
 	}
@@ -596,13 +617,16 @@ func (p *CPU) Run(ctx context.Context) error {
 		lostChannel              = make(chan uint64)
 		requestUnwindInfoChannel = make(chan int)
 	)
+	// 这里就是用来接收perf events map，来处理
 	perfBuf, err := m.InitPerfBuf("events", eventsChan, lostChannel, 64)
 	if err != nil {
 		return fmt.Errorf("failed to init perf buffer: %w", err)
 	}
 	perfBuf.Poll(int(p.perfEventBufferPollInterval.Milliseconds()))
+	// 新增一gorotuine 来处理
 	go p.listenEvents(ctx, eventsChan, lostChannel, requestUnwindInfoChannel)
 
+	// 起了一个协程，给对应的pid，添加展开表用来展开
 	go onDemandUnwindInfoBatcher(ctx, requestUnwindInfoChannel, 150*time.Millisecond, func(pids []int) {
 		for _, pid := range pids {
 			p.addUnwindTableForProcess(pid)
@@ -610,6 +634,7 @@ func (p *CPU) Run(ctx context.Context) error {
 
 		// Must be called after all the calls to `addUnwindTableForProcess`, as it's possible
 		// that the current in-flight shard hasn't been written to the BPF map, yet.
+		// 持久化展开表
 		err := p.bpfMaps.PersistUnwindTable()
 		if err != nil {
 			if errors.Is(err, ErrNeedMoreProfilingRounds) {
@@ -620,6 +645,7 @@ func (p *CPU) Run(ctx context.Context) error {
 		}
 	})
 
+	// 获取定时器
 	ticker := time.NewTicker(p.profilingDuration)
 	defer ticker.Stop()
 
@@ -631,8 +657,9 @@ func (p *CPU) Run(ctx context.Context) error {
 		case <-ticker.C:
 		}
 
-		// 定时轮询开始
+		// 时间到，开始获取profile
 		obtainStart := time.Now()
+		// 从ebpf map中获取profile 数据
 		rawData, err := p.obtainRawData(ctx)
 		if err != nil {
 			p.metrics.obtainAttempts.WithLabelValues(labelError).Inc()
@@ -655,7 +682,8 @@ func (p *CPU) Run(ctx context.Context) error {
 			}
 
 			groupedRawData[pid] = profile.ProcessRawData{
-				PID:        perThreadRawData.PID,
+				PID: perThreadRawData.PID,
+				// 添加采样数据
 				RawSamples: append(data.RawSamples, perThreadRawData.RawSamples...),
 			}
 		}
@@ -672,6 +700,7 @@ func (p *CPU) Run(ctx context.Context) error {
 				continue
 			}
 
+			// 转换执行路径
 			pprof, executableInfos, err := p.profileConverter.NewConverter(
 				pfs,
 				pid,

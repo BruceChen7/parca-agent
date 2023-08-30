@@ -76,11 +76,15 @@ _Static_assert(1 << MAX_BINARY_SEARCH_DEPTH >= MAX_UNWIND_TABLE_SIZE, "unwind ta
 #define ENABLE_STATS_PRINTING false
 
 // Stack walking methods.
+// 两种方式
+// 一种是基于rbp
+// 一种是基于dwarf
 enum stack_walking_method {
   STACK_WALKING_METHOD_FP = 0,
   STACK_WALKING_METHOD_DWARF = 1,
 };
 
+// 展开配置项目
 struct unwinder_config_t {
   bool filter_processes;
   bool verbose_logging;
@@ -356,6 +360,7 @@ static __always_inline void request_unwind_information(struct bpf_perf_event_dat
 }
 
 static __always_inline void request_process_mappings(struct bpf_perf_event_data *ctx, int user_pid) {
+  // 发给golang程序处理
   u64 payload = REQUEST_PROCESS_MAPPINGS | user_pid;
   bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &payload, sizeof(u64));
 }
@@ -439,6 +444,7 @@ enum find_unwind_table_return {
 // and offset can be passed that will be filled in with the mapping's load
 // address.
 static __always_inline enum find_unwind_table_return find_unwind_table(chunk_info_t **chunk_info, pid_t pid, u64 pc, u64 *offset) {
+  // 获取进程信息
   process_info_t *proc_info = bpf_map_lookup_elem(&process_info, &pid);
   // Appease the verifier.
   if (proc_info == NULL) {
@@ -637,12 +643,17 @@ static __always_inline void add_stack(struct bpf_perf_event_data *ctx, u64 pid_t
   // and the thread group ID in the upper 32 bits
   // (what user space often thinks of as the PID).
 
+  // 进程组id， 通常认为是用户空间的id
   int user_pid = pid_tgid >> 32;
+  // 线程id
   int user_tgid = pid_tgid;
+  // 设置位进程组id
   stack_key.pid = user_pid;
+  // 线程id
   stack_key.tid = user_tgid;
 
   if (method == STACK_WALKING_METHOD_DWARF) {
+    // 获取一个hash值
     int stack_hash = MurmurHash2((u32 *)unwind_state->stack.addresses, MAX_STACK_DEPTH * sizeof(u64) / sizeof(u32), 0);
     LOG("stack hash %d", stack_hash);
     stack_key.user_stack_id_dwarf = stack_hash;
@@ -653,6 +664,10 @@ static __always_inline void add_stack(struct bpf_perf_event_data *ctx, u64 pid_t
       LOG("[error] bpf_map_update_elem with ret: %d", err);
     }
   } else if (method == STACK_WALKING_METHOD_FP) {
+    // bpf_get_stackid
+    // ctx:当前BPF程序上下文
+    // map:用来保存堆栈跟踪到ID映射的hash表
+    // flags:是否关注用户空间堆栈
     int stack_id = bpf_get_stackid(ctx, &stack_traces, BPF_F_USER_STACK);
     // `bpf_get_stackid` returns an error if two different stacks share
     // their hash, but not if stack unwinding failed due to the stack being
@@ -662,6 +677,8 @@ static __always_inline void add_stack(struct bpf_perf_event_data *ctx, u64 pid_t
       LOG("[warn] bpf_get_stackid user failed with %d", stack_id);
       return;
     }
+    // 获取stack id
+    // 将 **stack信息关联到一个 stack id**，而这个 id 是**对当前栈的指令指针地址（instruction pointer address）进行 32-bit hash** 得到的。
     stack_key.user_stack_id = stack_id;
   }
 
@@ -676,6 +693,7 @@ static __always_inline void add_stack(struct bpf_perf_event_data *ctx, u64 pid_t
   // Aggregate stacks.
   u64 *scount = bpf_map_lookup_or_try_init(&stack_counts, &stack_key, &zero);
   if (scount) {
+      // 加一
     __sync_fetch_and_add(scount, 1);
   }
 
@@ -683,8 +701,10 @@ static __always_inline void add_stack(struct bpf_perf_event_data *ctx, u64 pid_t
 }
 
 // The unwinding machinery lives here.
+// 是一个尾递归调用
 SEC("perf_event")
 int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
+    // 获取线程id
   u64 pid_tgid = bpf_get_current_pid_tgid();
   int user_pid = pid_tgid;
   int err = 0;
@@ -694,16 +714,19 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
 
   bool dwarf_to_jit = false;
 
+  // 获取当前的展开状态
   unwind_state_t *unwind_state = bpf_map_lookup_elem(&heap, &zero);
   if (unwind_state == NULL) {
     LOG("unwind_state is NULL, should not happen");
     return 1;
   }
 
+  // 开始展开
   for (int i = 0; i < MAX_STACK_DEPTH_PER_PROGRAM; i++) {
     LOG("[debug] Within unwinding machinery loop");
     LOG("## frame: %d", unwind_state->stack.len);
 
+    //  指令寄存器的位置位置
     LOG("\tcurrent pc: %llx", unwind_state->ip);
     LOG("\tcurrent sp: %llx", unwind_state->sp);
     LOG("\tcurrent bp: %llx", unwind_state->bp);
@@ -711,6 +734,7 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
     u64 offset = 0;
 
     chunk_info_t *chunk_info = NULL;
+    // 展开表结果
     enum find_unwind_table_return unwind_table_result = find_unwind_table(&chunk_info, user_pid, unwind_state->ip, &offset);
 
     if (unwind_table_result == FIND_UNWIND_JITTED) {
@@ -815,16 +839,20 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
     LOG("le offset: %llx", offset);
     u64 left = chunk_info->low_index;
     u64 right = chunk_info->high_index;
+    // ebpf 用来输出日志
     LOG("========== left %llu right %llu", left, right);
 
+    // 找到相关的table index
     u64 table_idx = find_offset_for_pc(unwind_table, unwind_state->ip - offset, left, right);
 
+    // ebpf 程序异常
     if (table_idx == BINARY_SEARCH_DEFAULT || table_idx == BINARY_SEARCH_SHOULD_NEVER_HAPPEN || table_idx == BINARY_SEARCH_EXHAUSTED_ITERATIONS) {
       LOG("[error] binary search failed with %llx", table_idx);
       return 1;
     }
 
     LOG("\t=> table_index: %d", table_idx);
+    // 调整pc值
     LOG("\t=> adjusted pc: %llx", unwind_state->ip - offset);
 
     // Appease the verifier.
@@ -834,6 +862,7 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
       return 1;
     }
 
+    // 找到对应开FDE entry
     u64 found_pc = unwind_table->rows[table_idx].pc;
     u8 found_cfa_type = unwind_table->rows[table_idx].cfa_type;
     u8 found_rbp_type = unwind_table->rows[table_idx].rbp_type;
@@ -841,6 +870,7 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
     s16 found_rbp_offset = unwind_table->rows[table_idx].rbp_offset;
     LOG("\tcfa type: %d, offset: %d (row pc: %llx)", found_cfa_type, found_cfa_offset, found_pc);
 
+    // 没有找到相关的FDE
     if (found_cfa_type == CFA_TYPE_END_OF_FDE_MARKER) {
       LOG("[info] PC %llx not contained in the unwind info, found marker", unwind_state->ip);
       reached_bottom_of_stack = true;
@@ -860,6 +890,11 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
     // Appease the verifier.
     // For some reason bailing out here if the condition is not true does
     // not work?
+    // 安抚验证器。
+    // 因为某种原因，如果条件不成立，此处不退出
+    // 会失效？
+    // 这是针对这种情况的，即我们不是从JIT切换到DWARF段进行解扰
+    // 即unwind_state->unwinding_jit 为假
 
     // This is for the case when we are NOT switching unwinding from JIT to DWARF section
     // i.e. unwind_state->unwinding_jit holds false
@@ -884,7 +919,19 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
       return 1;
     }
 
+    // * 基于DWARF的栈回溯在运行时总是满足如下公式**:
+    // * CFAx=SPx+offsetx;
+    //     * CFAx: 栈回溯时第x级函数的CFA
+    //     * SPx: 此函数运行到其指令位置pc时硬件寄存器sp的值(除最后一级函数外此值只能通过计算得出，故这里为SPx)
+    //     * offsetx: SPx和CFAx之间的偏移, 其随着函数A中指令的执行而变化，**但对于函数中每一条指令，此偏移都会在编译期间确定**,
+    //     * 运行时**offsetx取决于当前函数FDE表中当前PC位置处记录的偏移**。
+    // * SPx+1 = CFAx;
+    //     * 这里的**x + 1 是下角标的意思**
+    //     * 在第x级函数的入口(汇编角度), 函数的**CFA总是等于当前硬件寄存器sp的值**,
+    //     * 因此栈回溯到父函数时父函数当前的SPx+1总是可以用CFAx来替换。
+    //     previous_rsp 就是这里的SPx+1
     u64 previous_rsp = 0;
+    //  这里就是根据CFA type ，来解释found_cfa_offset
     if (found_cfa_type == CFA_TYPE_RBP) {
       previous_rsp = unwind_state->bp + found_cfa_offset;
     } else if (found_cfa_type == CFA_TYPE_RSP) {
@@ -994,6 +1041,7 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
     //
     // https://refspecs.linuxbase.org/elf/x86_64-abi-0.99.pdf
 
+      // rbp 初始状态位0
     if (unwind_state->bp == 0) {
       LOG("======= reached main! =======");
       add_stack(ctx, pid_tgid, STACK_WALKING_METHOD_DWARF, unwind_state);
@@ -1024,6 +1072,7 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
   } else if (unwind_state->stack.len < MAX_STACK_DEPTH && unwind_state->tail_calls < MAX_TAIL_CALLS) {
     LOG("Continuing walking the stack in a tail call, current tail %d", unwind_state->tail_calls);
     unwind_state->tail_calls++;
+    // 是一个递归调用
     bpf_tail_call(ctx, &programs, 0);
   }
 
@@ -1064,6 +1113,7 @@ static __always_inline bool set_initial_state(bpf_user_pt_regs_t *regs) {
     }
   } else {
     // in userspace
+    // 设置寄存器相关的值
     unwind_state->ip = PT_REGS_IP(regs);
     unwind_state->sp = PT_REGS_SP(regs);
     unwind_state->bp = PT_REGS_FP(regs);
@@ -1078,6 +1128,7 @@ static __always_inline int walk_user_stacktrace(struct bpf_perf_event_data *ctx)
   LOG("traversing stack using .eh_frame information!!");
   LOG("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
 
+  // 尾递归调用
   bpf_tail_call(ctx, &programs, 0);
   return 0;
 }
@@ -1086,12 +1137,14 @@ SEC("perf_event")
 int profile_cpu(struct bpf_perf_event_data *ctx) {
   u64 pid_tgid = bpf_get_current_pid_tgid();
   int user_pid = pid_tgid;
+  // tgpid，高32位
   int user_tgid = pid_tgid >> 32;
 
   if (user_pid == 0) {
     return 0;
   }
 
+  // 如果是内核线程，不再考虑
   if (is_kthread()) {
     return 0;
   }
@@ -1104,6 +1157,7 @@ int profile_cpu(struct bpf_perf_event_data *ctx) {
     }
   }
 
+  // 初始状态寄存器
   set_initial_state(&ctx->regs);
   u32 zero = 0;
   unwind_state_t *unwind_state = bpf_map_lookup_elem(&heap, &zero);
@@ -1154,6 +1208,7 @@ int profile_cpu(struct bpf_perf_event_data *ctx) {
 
   // 2. We did not have unwind information, let's see if we can unwind with frame
   // pointers.
+  // 有rbp信息，可以rbp栈展开
   if (has_fp(unwind_state->bp)) {
     add_stack(ctx, pid_tgid, STACK_WALKING_METHOD_FP, NULL);
     return 0;

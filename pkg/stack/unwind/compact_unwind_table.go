@@ -91,7 +91,9 @@ func BuildCompactUnwindTable(fdes frame.FrameDescriptionEntries) (CompactUnwindT
 	table := make(CompactUnwindTable, 0, 4*len(fdes)) // heuristic: we expect each function to have ~4 unwind entries.
 	for _, fde := range fdes {
 		frameContext := frame.ExecuteDwarfProgram(fde, nil)
+		// 这种遍历的方式
 		for insCtx := frameContext.Next(); frameContext.HasNext(); insCtx = frameContext.Next() {
+			// 对外暴露的只有rbp, ra, cfa
 			row := unwindTableRow(insCtx)
 			compactRow, err := rowToCompactRow(row)
 			if err != nil {
@@ -100,6 +102,7 @@ func BuildCompactUnwindTable(fdes frame.FrameDescriptionEntries) (CompactUnwindT
 			table = append(table, compactRow)
 		}
 		// Add a synthetic row for the end of the function.
+		// 对每个function 加一个哨兵row
 		table = append(table, CompactUnwindTableRow{
 			pc:      fde.End(),
 			cfaType: uint8(cfaTypeEndFdeMarker),
@@ -157,10 +160,13 @@ func rowToCompactRow(row *UnwindTableRow) (CompactUnwindTableRow, error) {
 	return CompactUnwindTableRow{
 		pc:                row.Loc,
 		_reservedDoNotUse: 0,
-		cfaType:           cfaType,
-		rbpType:           rbpType,
-		cfaOffset:         cfaOffset,
-		rbpOffset:         rbpOffset,
+		// cfa type 类型
+		cfaType: cfaType,
+		// rfb 类型
+		rbpType: rbpType,
+		// 偏移量
+		cfaOffset: cfaOffset,
+		rbpOffset: rbpOffset,
 	}, nil
 }
 

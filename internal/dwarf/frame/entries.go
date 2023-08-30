@@ -10,15 +10,17 @@ import (
 // CommonInformationEntry represents a Common Information Entry in
 // the Dwarf .debug_frame section.
 type CommonInformationEntry struct {
-	Length                uint32
-	CIE_id                uint32
-	Version               uint8
-	Augmentation          string
-	CodeAlignmentFactor   uint64
-	DataAlignmentFactor   int64
+	Length              uint32
+	CIE_id              uint32
+	Version             uint8
+	Augmentation        string
+	CodeAlignmentFactor uint64
+	DataAlignmentFactor int64
+	// 返回地址寄存器
 	ReturnAddressRegister uint64
-	InitialInstructions   []byte
-	staticBase            uint64
+	//指令
+	InitialInstructions []byte
+	staticBase          uint64
 
 	// eh_frame pointer encoding
 	ptrEncAddr ptrEnc
@@ -118,8 +120,13 @@ func (fdes FrameDescriptionEntries) Append(otherFDEs FrameDescriptionEntries) Fr
 type ptrEnc uint8
 
 const (
-	ptrEncAbs    ptrEnc = 0x00 // pointer-sized unsigned integer
-	ptrEncOmit   ptrEnc = 0xff // omitted
+	// 绝对编码
+	// 绝对指针地址。
+	// 其大小由 32 位或 64 位地址空间决定，将是 32 位或 64 位。
+	ptrEncAbs ptrEnc = 0x00 // pointer-sized unsigned integer
+	// 值要被忽略
+	ptrEncOmit ptrEnc = 0xff // omitted
+	// 该值为无符号 LEB128
 	ptrEncUleb   ptrEnc = 0x01 // ULEB128
 	ptrEncUdata2 ptrEnc = 0x02 // 2 bytes
 	ptrEncUdata4 ptrEnc = 0x03 // 4 bytes
@@ -132,8 +139,12 @@ const (
 
 	ptrEncFlagsMask ptrEnc = 0xf0
 
-	ptrEncPCRel    ptrEnc = 0x10 // value is relative to the memory address where it appears
-	ptrEncTextRel  ptrEnc = 0x20 // value is relative to the address of the text section
+	// 高位，寻址方式
+	// pc is realtive
+	ptrEncPCRel ptrEnc = 0x10 // value is relative to the memory address where it appears
+	// value is text  relative
+	ptrEncTextRel ptrEnc = 0x20 // value is relative to the address of the text section
+	// data relative
 	ptrEncDataRel  ptrEnc = 0x30 // value is relative to the address of the data section
 	ptrEncFuncRel  ptrEnc = 0x40 // value is relative to the start of the function
 	ptrEncAligned  ptrEnc = 0x50 // value should be aligned
@@ -145,11 +156,13 @@ const (
 // Supported returns true if this pointer encoding is supported.
 func (ptrEnc ptrEnc) Supported() bool {
 	if ptrEnc != ptrEncOmit {
+		// 取低4位
 		szenc := ptrEnc & 0x0f
 		if ((szenc > ptrEncUdata8) && (szenc < ptrEncSigned)) || (szenc > ptrEncSdata8) {
 			// These values aren't defined at the moment
 			return false
 		}
+		// 只支持 pc relative
 		if (ptrEnc&ptrEncFlagsMask)&^ptrEncSupportedFlags != 0 {
 			// Currently only the PC relative flag is supported
 			return false

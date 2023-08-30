@@ -15,16 +15,18 @@ import (
 type parsefunc func(*parseContext) parsefunc
 
 type parseContext struct {
+	// 默认是中0开始的
 	staticBase uint64
 
-	buf         *bytes.Buffer
-	totalLen    int
-	entries     FrameDescriptionEntries
-	ciemap      map[int]*CommonInformationEntry
-	common      *CommonInformationEntry
-	frame       *FrameDescriptionEntry
-	length      uint32
-	ptrSize     int
+	buf      *bytes.Buffer
+	totalLen int
+	entries  FrameDescriptionEntries
+	ciemap   map[int]*CommonInformationEntry
+	common   *CommonInformationEntry
+	frame    *FrameDescriptionEntry
+	length   uint32
+	ptrSize  int
+	// ehFrameAddr is the address at which eh_frame will be mapped into memory.
 	ehFrameAddr uint64
 	err         error
 }
@@ -147,7 +149,11 @@ func parseFDE(ctx *parseContext) parsefunc {
 	// address pointer encoding is considered.
 	// See decode_frame_entry_1 in gdb/dwarf2-frame.c.
 	// For .debug_frame ptrEncAddr is always ptrEncAbs and never has flags.
+	// 取低4位
+	// 在 .eh_frame 中，仅考虑地址指针编码的大小部分
+	// 对于 .debug_frame，ptrEncAddr 始终为 ptrEncAbs，永远不带标志位。
 	sizePtrEnc := ctx.frame.CIE.ptrEncAddr & 0x0f
+	// frame 的大小
 	ctx.frame.size = ctx.readEncodedPtr(0, reader, sizePtrEnc)
 
 	// Insert into the tree after setting address range begin
@@ -173,9 +179,10 @@ func parseFDE(ctx *parseContext) parsefunc {
 	if err != nil {
 		panic("Could not seek")
 	}
+	// 剩余的全是frame的指令
 	ctx.frame.Instructions = r[off:]
 	ctx.length = 0
-	// 开始下一轮
+	// 开始下一轮parseCIEinfo
 	return parselength
 }
 
@@ -224,6 +231,7 @@ func parseCIE(ctx *parseContext) parsefunc {
 		ctx.common.ReturnAddressRegister, _ = util.DecodeULEB128(buf)
 	}
 
+	// 默认是绝对值编码
 	ctx.common.ptrEncAddr = ptrEncAbs
 
 	if ctx.parsingEHFrame() && len(ctx.common.Augmentation) > 0 {
@@ -242,6 +250,7 @@ func parseCIE(ctx *parseContext) parsefunc {
 				b, _ := buf.ReadByte()
 				// 那么下一个字节是FDE编码
 				ctx.common.ptrEncAddr = ptrEnc(b)
+				// 指针编码方式是否支持
 				if !ctx.common.ptrEncAddr.Supported() {
 					ctx.err = fmt.Errorf("pointer encoding not supported %#x at %#x", ctx.common.ptrEncAddr, ctx.offset())
 					return nil
@@ -290,6 +299,11 @@ func parseCIE(ctx *parseContext) parsefunc {
 // The parameter addr is the address that the current byte of 'buf' will be
 // mapped to when the executable file containing the eh_frame section being
 // parse is loaded in memory.
+// readEncodedPtr按照ptrEnc的规定从buf中解析编码的指针。
+// 此函数用于从.eh_frame节中读取指针，
+// 在解析.debug_frame节时，ptrEnc将始终为ptrEncAbs。
+// 参数addr是将buf当前字节映射到的地址，
+// 当加载包含eh_frame节的可执行文件到内存中时，将对其进行解析。
 func (ctx *parseContext) readEncodedPtr(addr uint64, buf util.ByteReaderWithLen, ptrEnc ptrEnc) uint64 {
 	if ptrEnc == ptrEncOmit {
 		return 0
@@ -300,7 +314,9 @@ func (ctx *parseContext) readEncodedPtr(addr uint64, buf util.ByteReaderWithLen,
 	// TODO(javierhonduco): Check for the correctness of this.
 	//nolint:exhaustive
 	switch ptrEnc & 0xf {
+	// 获取编码信息
 	case ptrEncAbs, ptrEncSigned:
+		// 获取指针大小
 		ptr, _ = util.ReadUintRaw(buf, binary.LittleEndian, ctx.ptrSize)
 	case ptrEncUleb:
 		ptr, _ = util.DecodeULEB128(buf)
@@ -321,7 +337,10 @@ func (ctx *parseContext) readEncodedPtr(addr uint64, buf util.ByteReaderWithLen,
 		ptr = uint64(n)
 	}
 
+	// 如果显示相对编码
+	// 只支持pc relative
 	if ptrEnc&0xf0 == ptrEncPCRel {
+		// 返回计算后的地址
 		ptr += addr
 	}
 

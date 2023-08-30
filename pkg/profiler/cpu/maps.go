@@ -44,7 +44,8 @@ import (
 )
 
 const (
-	debugPIDsMapName   = "debug_pids"
+	debugPIDsMapName = "debug_pids"
+	// 通过名字来映射在C语言上的和go语言中的
 	stackCountsMapName = "stack_counts"
 	stackTracesMapName = "stack_traces"
 
@@ -687,9 +688,11 @@ func (m *bpfMaps) generateCompactUnwindTable(fullExecutablePath string, mapping 
 
 	// Sort them, as this will ensure that the generated table
 	// is also sorted. Sorting fewer elements will be faster.
+	// 对这些FDE进行排序
 	sort.Sort(fdes)
 
 	// Generate the compact unwind table.
+	// 展开表build
 	ut, err = unwind.BuildCompactUnwindTable(fdes)
 	if err != nil {
 		return ut, err
@@ -697,6 +700,7 @@ func (m *bpfMaps) generateCompactUnwindTable(fullExecutablePath string, mapping 
 
 	// This should not be necessary, as per the sorting above, but
 	// just in case :).
+	// 按指令排序
 	sort.Sort(ut)
 
 	// Now we have a full compact unwind table that we have to split in different BPF maps.
@@ -820,6 +824,7 @@ func (m *bpfMaps) persistUnwindTable() error {
 			if m.profilingRoundsWithoutUnwindInfoReset < minRoundsBeforeRedoingUnwindInfo {
 				level.Debug(m.logger).Log("msg", "not enough profile loops, we need to wait to reset unwind info")
 				m.waitingToResetUnwindInfo = true
+				// 返回需要处理的错误
 				return ErrNeedMoreProfilingRounds
 			}
 
@@ -1009,6 +1014,7 @@ func (m *bpfMaps) setUnwindTableForMapping(buf *profiler.EfficientBuffer, pid in
 	// Generated and add the unwind table, if needed.
 	if !mappingAlreadySeen {
 		unwindShardsValBuf := new(bytes.Buffer)
+		//  用来传递unwind表 给ebpf程序
 		unwindShardsValBuf.Grow(unwindShardsSizeBytes)
 
 		// Generate the unwind table.
@@ -1060,6 +1066,7 @@ func (m *bpfMaps) setUnwindTableForMapping(buf *profiler.EfficientBuffer, pid in
 			currentChunkCandidate := restChunks[:maxThreshold]
 			threshold := maxThreshold
 			for i := maxThreshold - 1; i >= 0; i-- {
+				// 找到该函数结束的FDE
 				if currentChunkCandidate[i].IsEndOfFDEMarker() {
 					break
 				}
@@ -1152,6 +1159,7 @@ func (m *bpfMaps) setUnwindTableForMapping(buf *profiler.EfficientBuffer, pid in
 			if m.availableEntries() == 0 {
 				level.Info(m.logger).Log("msg", "creating a new shard as we ran out of space")
 
+				// 分配一个新的shard
 				if err := m.allocateNewShard(); err != nil {
 					return err
 				}
@@ -1167,6 +1175,7 @@ func (m *bpfMaps) setUnwindTableForMapping(buf *profiler.EfficientBuffer, pid in
 			return fmt.Errorf("failed to update unwind shard: %w", err)
 		}
 
+		// 自增一次
 		m.executableID++
 		m.uniqueMappings++
 	}

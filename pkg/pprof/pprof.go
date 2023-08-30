@@ -53,6 +53,7 @@ type Manager struct {
 
 func NewManager(
 	logger log.Logger,
+	// prometheus register
 	reg prometheus.Registerer,
 	ksym *ksym.Ksym,
 	perfMapCache *perf.PerfMapCache,
