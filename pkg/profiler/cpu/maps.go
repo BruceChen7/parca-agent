@@ -357,6 +357,7 @@ func (m *bpfMaps) create() error {
 	}
 
 	m.debugPIDs = debugPIDs
+	// 栈统计
 	m.stackCounts = stackCounts
 	m.stackTraces = stackTraces
 	m.unwindShards = unwindShards
@@ -541,6 +542,7 @@ func (m *bpfMaps) refreshProcessInfo(pid int) {
 
 	cachedHash, _ := m.processCache.Get(pid)
 
+	// 重新获取进程信息
 	proc, err := procfs.NewProc(pid)
 	if err != nil {
 		return
@@ -623,6 +625,7 @@ func (m *bpfMaps) addUnwindTableForProcess(pid int, executableMappings unwind.Ex
 		if executableMapping.IsJitDump() {
 			continue
 		}
+		// 每个可执行的断，设置展开的表
 		if err := m.setUnwindTableForMapping(&mappingInfoMemory, pid, executableMapping); err != nil {
 			return fmt.Errorf("setUnwindTableForMapping for executable %s starting at 0x%x failed: %w", executableMapping.Executable, executableMapping.StartAddr, err)
 		}
@@ -667,6 +670,12 @@ func (m *bpfMaps) addUnwindTableForProcess(pid int, executableMappings unwind.Ex
 
 // generateCompactUnwindTable produces the compact unwidn table for a given
 // executable.
+// writeUnwindTableRow函数将紧凑型取消展开表行写入提供的切片。
+//
+// 注意：避免使用`binary.Write`，更倾向于使用较低级别的API，
+// 以避免在反射代码路径中产生分配和CPU消耗，
+// 并避免为中间缓冲区进行分配所带来的开销。
+
 func (m *bpfMaps) generateCompactUnwindTable(fullExecutablePath string, mapping *unwind.ExecutableMapping) (unwind.CompactUnwindTable, error) {
 	var ut unwind.CompactUnwindTable
 

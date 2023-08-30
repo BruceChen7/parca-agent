@@ -136,6 +136,7 @@ func executableMappingCount(rawMappings []*procfs.ProcMap) uint {
 func ListExecutableMappings(rawMappings []*procfs.ProcMap) ExecutableMappings {
 	result := make([]*ExecutableMapping, 0, executableMappingCount(rawMappings))
 	firstSeen := false
+	// 可能有多个可执行的内存映射
 	for idx, rawMapping := range rawMappings {
 		if rawMapping.Perms.Execute {
 			var loadAddr uint64
@@ -143,6 +144,7 @@ func ListExecutableMappings(rawMappings []*procfs.ProcMap) ExecutableMappings {
 			// information. We don't know of any runtimes that emit said unwind
 			// information for JITed code, so we set it to zero.
 			if rawMappings[idx].Pathname != "" {
+				// 逆序遍历,找到第一个可执行的内存映射
 				for revIdx := idx; revIdx >= 0; revIdx-- {
 					if rawMappings[revIdx].Pathname != rawMappings[idx].Pathname {
 						break
@@ -152,7 +154,9 @@ func ListExecutableMappings(rawMappings []*procfs.ProcMap) ExecutableMappings {
 			}
 
 			mapping := ExecutableMapping{
-				LoadAddr:  loadAddr,
+				// 加载地址是第一个内存镜像开始加载的地址
+				LoadAddr: loadAddr,
+				// 这个mapping开始的地址
 				StartAddr: uint64(rawMapping.StartAddr),
 				EndAddr:   uint64(rawMapping.EndAddr),
 				// 这里执行写路径
@@ -168,7 +172,7 @@ func ListExecutableMappings(rawMappings []*procfs.ProcMap) ExecutableMappings {
 				continue
 			}
 			result = append(result, &mapping)
-
+			// 不再是主程序
 			firstSeen = true
 		}
 	}

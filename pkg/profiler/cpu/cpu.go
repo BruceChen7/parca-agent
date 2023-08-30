@@ -214,6 +214,7 @@ func loadBpfProgram(logger log.Logger, reg prometheus.Registerer, mixedUnwinding
 		},
 	})
 
+	// 获取bpf对象
 	f, err := bpfObjects.Open(fmt.Sprintf("bpf/%s/cpu.bpf.o", runtime.GOARCH))
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open BPF object: %w", err)
@@ -261,6 +262,7 @@ func loadBpfProgram(logger log.Logger, reg prometheus.Registerer, mixedUnwinding
 			return nil, nil, fmt.Errorf("failed to adjust map sizes: %w", err)
 		}
 
+		//  用来初始化全局变量
 		if err := m.InitGlobalVariable(configKey, Config{FilterProcesses: debugEnabled, VerboseLogging: verboseBpfLogging, MixedStackWalking: mixedUnwinding}); err != nil {
 			return nil, nil, fmt.Errorf("init global variable: %w", err)
 		}
@@ -629,6 +631,7 @@ func (p *CPU) Run(ctx context.Context) error {
 		case <-ticker.C:
 		}
 
+		// 定时轮询开始
 		obtainStart := time.Now()
 		rawData, err := p.obtainRawData(ctx)
 		if err != nil {

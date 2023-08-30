@@ -40,6 +40,7 @@ func Parse(data []byte, order binary.ByteOrder, staticBase uint64, ptrSize int, 
 		pctx = &parseContext{buf: buf, totalLen: len(data), entries: newFrameIndex(), staticBase: staticBase, ptrSize: ptrSize, ehFrameAddr: ehFrameAddr, ciemap: map[int]*CommonInformationEntry{}}
 	)
 
+	// 状态机器
 	for fn := parselength; buf.Len() != 0; {
 		fn = fn(pctx)
 		if pctx.err != nil {
@@ -47,6 +48,7 @@ func Parse(data []byte, order binary.ByteOrder, staticBase uint64, ptrSize int, 
 		}
 	}
 
+	// 设置order
 	for i := range pctx.entries {
 		pctx.entries[i].order = order
 	}

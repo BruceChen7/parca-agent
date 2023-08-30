@@ -217,6 +217,7 @@ typedef struct {
 BPF_HASH(debug_pids, int, u8, 1); // Table size will be updated in userspace.
 BPF_HASH(process_info, int, process_info_t, MAX_PROCESSES);
 
+// 获取stack_traces
 BPF_STACK_TRACE(stack_traces, MAX_STACK_TRACES_ENTRIES);
 BPF_HASH(dwarf_stack_traces, int, stack_trace_t, MAX_STACK_TRACES_ENTRIES);
 BPF_HASH(stack_counts, stack_count_key_t, u64, MAX_STACK_COUNTS_ENTRIES);
@@ -233,6 +234,7 @@ struct {
   __type(value, unwind_state_t);
 } heap SEC(".maps");
 
+// percpu_stats
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
   __uint(max_entries, 1);
