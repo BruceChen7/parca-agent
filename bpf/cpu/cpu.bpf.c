@@ -598,8 +598,11 @@ static __always_inline bool has_fp(u64 current_fp) {
   u64 ra;
   int i;
 
+  // 最大的栈深度
   for (i = 0; i < MAX_STACK_DEPTH; i++) {
+    // 获取当前的frame pointer，将current_fp指向的内容，读入next_fb
     int err = bpf_probe_read_user(&next_fp, 8, (void *)current_fp);
+    // 获取ra
     bpf_probe_read_user(&ra, 8, (void *)current_fp + 8);
     if (err < 0) {
       // LOG("[debug] fp read failed with %d i %d", err, i);
@@ -621,9 +624,11 @@ static __always_inline bool has_fp(u64 current_fp) {
   // DWARF-derived unwind information.
   if (next_fp == 0) {
     // LOG("[debug] fp success: %d", i > 2);
+    // 至少为2个
     return i > 2;
   }
 
+  // 判断是否能使用的fram-pointer
   LOG("[debug] last frame pointer is not zero");
   return false;
 }
