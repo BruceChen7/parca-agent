@@ -131,6 +131,7 @@ func rowToCompactRow(row *UnwindTableRow) (CompactUnwindTableRow, error) {
 			// cfa是基于rsp
 			cfaType = uint8(cfaTypeRsp)
 		}
+		// 获取cfa的偏移
 		cfaOffset = int16(row.CFA.Offset)
 	case frame.RuleExpression:
 		cfaType = uint8(cfaTypeExpression)
@@ -162,9 +163,10 @@ func rowToCompactRow(row *UnwindTableRow) (CompactUnwindTableRow, error) {
 	}
 
 	return CompactUnwindTableRow{
+		// 当前的指令
 		pc:                row.Loc,
 		_reservedDoNotUse: 0,
-		// cfa type 类型
+		// cfa type 类型，基于rbp还是容嫔
 		cfaType: cfaType,
 		// rfb 类型
 		rbpType: rbpType,

@@ -638,6 +638,7 @@ func (m *bpfMaps) addUnwindTableForProcess(pid int, executableMappings unwind.Ex
 	// information has. During this window unwinding might fail. Particularly,
 	// this is a problem when we decide to delay regenerating the dwarf state
 	// when running out of shards.
+	// 用来更新内核态进程信息
 	if err := m.processInfo.Update(unsafe.Pointer(&pid), unsafe.Pointer(&m.mappingInfoMemory[0])); err != nil {
 		if errors.Is(err, syscall.E2BIG) {
 			if m.profilingRoundsWithoutProcessInfoReset < minRoundsBeforeRedoingProcessInformation {
@@ -715,6 +716,7 @@ func (m *bpfMaps) generateCompactUnwindTable(fullExecutablePath string, mapping 
 // Note: we are avoiding `binary.Write` and prefer to use the lower level APIs
 // to avoid allocations and CPU spent in the reflection code paths as well as
 // in the allocations for the intermediate buffers.
+// 写到ebpfmap中
 func (m *bpfMaps) writeUnwindTableRow(rowSlice *profiler.EfficientBuffer, row unwind.CompactUnwindTableRow) {
 	// .pc
 	rowSlice.PutUint64(row.Pc())
@@ -1170,6 +1172,7 @@ func (m *bpfMaps) setUnwindTableForMapping(buf *profiler.EfficientBuffer, pid in
 		}
 
 		executableID := m.executableID
+		// 写到ebpf map
 		if err := m.unwindShards.Update(
 			unsafe.Pointer(&executableID),
 			unsafe.Pointer(&unwindShardsValBuf.Bytes()[0])); err != nil {

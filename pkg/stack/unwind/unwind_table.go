@@ -90,6 +90,7 @@ func (ptb *UnwindTableBuilder) PrintTable(writer io.Writer, path string, compact
 				break
 			}
 
+			// 如果使用compat模式
 			if compact {
 				compactRow, err := rowToCompactRow(unwindRow)
 				if err != nil {

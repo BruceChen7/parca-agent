@@ -179,13 +179,16 @@ typedef struct {
   u64 load_address;
   u64 begin;
   u64 end;
+  // 执行id
   u64 executable_id;
   u64 type;
 } mapping_t;
 
 // Executable mappings for a process.
+// 进程对应的mapping信息
 typedef struct {
   u64 is_jit_compiler;
+  // 有多少个mapping
   u64 len;
   mapping_t mappings[MAX_MAPPINGS_PER_PROCESS];
 } process_info_t;
@@ -219,6 +222,7 @@ typedef struct {
 /*================================ MAPS =====================================*/
 
 BPF_HASH(debug_pids, int, u8, 1); // Table size will be updated in userspace.
+// 是一个hash表
 BPF_HASH(process_info, int, process_info_t, MAX_PROCESSES);
 
 // 获取stack_traces
@@ -226,6 +230,7 @@ BPF_STACK_TRACE(stack_traces, MAX_STACK_TRACES_ENTRIES);
 BPF_HASH(dwarf_stack_traces, int, stack_trace_t, MAX_STACK_TRACES_ENTRIES);
 BPF_HASH(stack_counts, stack_count_key_t, u64, MAX_STACK_COUNTS_ENTRIES);
 
+// 展开表信息，用来展开栈
 BPF_HASH(unwind_info_chunks, u64, unwind_info_chunks_t,
          5 * 1000); // Mapping of executable ID to unwind info chunks.
 BPF_HASH(unwind_tables, u64, stack_unwind_table_t,
@@ -357,6 +362,7 @@ static __always_inline void request_unwind_information(struct bpf_perf_event_dat
   bpf_get_current_comm(comm, 20);
   LOG("[debug] no fp, no unwind info for PID: %d, comm: %s ctx IP: %llx", user_pid, comm, PT_REGS_IP(&ctx->regs));
 
+  // 获取unwind信息
   u64 payload = REQUEST_UNWIND_INFORMATION | user_pid;
   bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &payload, sizeof(u64));
 }
@@ -430,6 +436,7 @@ static __always_inline bool is_debug_enabled_for_pid(int pid) {
   return false;
 }
 
+// 找到展开表的状态
 enum find_unwind_table_return {
   FIND_UNWIND_SUCCESS = 1,
 
@@ -472,6 +479,7 @@ static __always_inline enum find_unwind_table_return find_unwind_table(chunk_inf
       return FIND_UNWIND_MAPPING_SHOULD_NEVER_HAPPEN;
     }
 
+    // 找到了对应的mapping
     if (proc_info->mappings[i].begin <= pc && pc <= proc_info->mappings[i].end) {
       found = true;
       executable_id = proc_info->mappings[i].executable_id;
@@ -483,6 +491,7 @@ static __always_inline enum find_unwind_table_return find_unwind_table(chunk_inf
 
   if (found) {
     if (offset != NULL) {
+      // 设置加载地址
       *offset = load_address;
     }
 
@@ -510,14 +519,17 @@ static __always_inline enum find_unwind_table_return find_unwind_table(chunk_inf
     return FIND_UNWIND_CHUNK_NOT_FOUND;
   }
 
+  // 使用相对地址
   u64 adjusted_pc = pc - load_address;
   for (int i = 0; i < MAX_UNWIND_TABLE_CHUNKS; i++) {
     // Reached last chunk.
     if (chunks->chunks[i].low_pc == 0) {
       break;
     }
+    //  成功找到
     if (chunks->chunks[i].low_pc <= adjusted_pc && adjusted_pc <= chunks->chunks[i].high_pc) {
       LOG("[info] found chunk");
+      // 改写chunk地址
       *chunk_info = &chunks->chunks[i];
       return FIND_UNWIND_SUCCESS;
     }
@@ -537,12 +549,14 @@ static __always_inline bool in_kernel(u64 ip) {
 // We don't check for the return value of `retrieve_task_registers`, it's
 // caller due the verifier not liking that code.
 static __always_inline bool is_kthread() {
+  // 获取进程信息
   struct task_struct *task = (struct task_struct *)bpf_get_current_task();
   if (task == NULL) {
     return false;
   }
 
   void *mm;
+  // 获取mm信息
   int err = bpf_probe_read_kernel(&mm, 8, &task->mm);
   if (err) {
     LOG("[warn] bpf_probe_read_kernel failed with %d", err);
@@ -830,6 +844,7 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
       LOG("special section, stopping");
       return 1;
     } else if (unwind_table_result == FIND_UNWIND_MAPPING_NOT_FOUND) {
+      // 请求找到mappings
       request_refresh_process_info(ctx, user_pid);
       return 1;
     } else if (chunk_info == NULL) {
@@ -838,6 +853,7 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
       break;
     }
 
+    // hash 表中查找
     stack_unwind_table_t *unwind_table = bpf_map_lookup_elem(&unwind_tables, &chunk_info->shard_index);
     if (unwind_table == NULL) {
       LOG("unwind table is null :( for shard %llu", chunk_info->shard_index);
@@ -964,6 +980,7 @@ int walk_user_stacktrace_impl(struct bpf_perf_event_data *ctx) {
         bump_unwind_error_should_never_happen();
         return 1;
       }
+      // 之前的容嫔
       previous_rsp = unwind_state->sp + 8 + ((((unwind_state->ip & 15) >= threshold)) << 3);
     } else {
       LOG("\t[unsup] register %d not valid (expected $rbp or $rsp)", found_cfa_type);
@@ -1153,6 +1170,7 @@ int profile_cpu(struct bpf_perf_event_data *ctx) {
   }
 
   // 如果是内核线程，不再考虑
+  // 在内核上下文中，没有mm
   if (is_kthread()) {
     return 0;
   }
@@ -1179,9 +1197,11 @@ int profile_cpu(struct bpf_perf_event_data *ctx) {
     bump_samples();
 
     chunk_info_t *chunk_info = NULL;
+    // 返回chunk_info
     enum find_unwind_table_return unwind_table_result = find_unwind_table(&chunk_info, user_pid, unwind_state->ip, NULL);
     if (chunk_info == NULL) {
       process_info_t *proc_info = bpf_map_lookup_elem(&process_info, &user_pid);
+      // 找到了进程mapping
       if (proc_info == NULL) {
         LOG("[error] should never happen");
         return 1;
@@ -1189,8 +1209,10 @@ int profile_cpu(struct bpf_perf_event_data *ctx) {
 
       if (unwind_table_result == FIND_UNWIND_MAPPING_NOT_FOUND) {
         LOG("[warn] IP 0x%llx not covered, mapping not found.", unwind_state->ip);
+        // 获取进程mapping信息
         request_refresh_process_info(ctx, user_pid);
         bump_unwind_error_pc_not_covered();
+        // 提前退出
         return 1;
       } else if (unwind_table_result == FIND_UNWIND_JITTED) {
         if (!unwinder_config.mixed_stack_enabled) {
@@ -1210,6 +1232,7 @@ int profile_cpu(struct bpf_perf_event_data *ctx) {
     }
 
     LOG("pid %d tgid %d", user_pid, user_tgid);
+    // 开始walk
     walk_user_stacktrace(ctx);
     return 0;
   }

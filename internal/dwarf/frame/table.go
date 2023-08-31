@@ -68,6 +68,7 @@ func (instructionContext *InstructionContext) Loc() uint64 {
 	return instructionContext.loc
 }
 
+// 用来遍历
 type InstructionContextIterator struct {
 	ctx         *Context
 	lastReached bool
@@ -80,12 +81,15 @@ func (ici *InstructionContextIterator) HasNext() bool {
 
 func (ici *InstructionContextIterator) Next() *InstructionContext {
 	for ici.ctx.buf.Len() > 0 {
+		// 上次的跑的pc位置
 		lastPcBefore := ici.ctx.lastInsCtx.loc
 		// 执行dwarf指令
 		executeDwarfInstruction(ici.ctx)
+		// 上次的pc
 		lastPcAfter := ici.ctx.lastInsCtx.loc
 		// We are at an instruction boundary when there's a program counter change.
 		if lastPcBefore != lastPcAfter {
+			// 返回最新的
 			return ici.ctx.lastInsCtx
 		}
 	}
@@ -295,6 +299,7 @@ func (ctx *Context) Execute(instructions []byte) *InstructionContextIterator {
 }
 
 func executeDwarfInstruction(ctx *Context) {
+	// 获取第一个字节
 	instruction, err := ctx.buf.ReadByte()
 	if err != nil {
 		panic("Could not read from instruction buffer")
@@ -332,6 +337,7 @@ func lookupFunc(instruction byte, ctx *Context) instruction {
 
 	if restoreOpcode {
 		// Restore the last byte as it actually contains the argument for the opcode.
+		// 倒退一个字节
 		err := buf.UnreadByte()
 		if err != nil {
 			panic("Could not unread byte")
@@ -502,7 +508,9 @@ func offset(ctx *Context) {
 	}
 
 	var (
-		reg       = b & low_6_offset
+		// 获取寄存器，操作码中有寄存器
+		reg = b & low_6_offset
+		// 获取操作数
 		offset, _ = util.DecodeULEB128(ctx.buf)
 	)
 
@@ -518,6 +526,7 @@ func restore(ctx *Context) {
 		panic(err)
 	}
 
+	// 获取寄存器
 	reg := uint64(b & low_6_offset)
 	restoreRule(reg, frame)
 }
