@@ -90,6 +90,7 @@ func (t CompactUnwindTable) Swap(i, j int)      { t[i], t[j] = t[j], t[i] }
 func BuildCompactUnwindTable(fdes frame.FrameDescriptionEntries) (CompactUnwindTable, error) {
 	table := make(CompactUnwindTable, 0, 4*len(fdes)) // heuristic: we expect each function to have ~4 unwind entries.
 	for _, fde := range fdes {
+		// evaluates the unwind opcodes for a function.
 		frameContext := frame.ExecuteDwarfProgram(fde, nil)
 		// 这种遍历的方式
 		for insCtx := frameContext.Next(); frameContext.HasNext(); insCtx = frameContext.Next() {
@@ -121,10 +122,13 @@ func rowToCompactRow(row *UnwindTableRow) (CompactUnwindTableRow, error) {
 	// CFA.
 	//nolint:exhaustive
 	switch row.CFA.Rule {
+	// 如果是CFA定义指令
 	case frame.RuleCFA:
 		if row.CFA.Reg == frame.X86_64FramePointer {
+			// cfaType 是基于rbp
 			cfaType = uint8(cfaTypeRbp)
 		} else if row.CFA.Reg == frame.X86_64StackPointer {
+			// cfa是基于rsp
 			cfaType = uint8(cfaTypeRsp)
 		}
 		cfaOffset = int16(row.CFA.Offset)

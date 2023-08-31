@@ -334,11 +334,13 @@ static __always_inline void *bpf_map_lookup_or_try_init(void *map, const void *k
   void *val;
   long err;
 
+  // 如果存在，直接返回value
   val = bpf_map_lookup_elem(map, key);
   if (val) {
     return val;
   }
 
+  // 不存在，则初始化
   err = bpf_map_update_elem(map, key, init, BPF_NOEXIST);
   if (err && !STACK_COLLISION(err)) {
     LOG("[error] bpf_map_lookup_or_try_init with ret: %d", err);
@@ -643,7 +645,7 @@ static __always_inline void add_stack(struct bpf_perf_event_data *ctx, u64 pid_t
   // and the thread group ID in the upper 32 bits
   // (what user space often thinks of as the PID).
 
-  // 进程组id， 通常认为是用户空间的id
+  // 进程组id， 通常认为是用户空间pid
   int user_pid = pid_tgid >> 32;
   // 线程id
   int user_tgid = pid_tgid;
@@ -653,12 +655,13 @@ static __always_inline void add_stack(struct bpf_perf_event_data *ctx, u64 pid_t
   stack_key.tid = user_tgid;
 
   if (method == STACK_WALKING_METHOD_DWARF) {
-    // 获取一个hash值
+    // 获取一个栈地址，计算hash值
     int stack_hash = MurmurHash2((u32 *)unwind_state->stack.addresses, MAX_STACK_DEPTH * sizeof(u64) / sizeof(u32), 0);
     LOG("stack hash %d", stack_hash);
     stack_key.user_stack_id_dwarf = stack_hash;
 
     // Insert stack.
+    // 插入和更新一个stack，是一个hash
     int err = bpf_map_update_elem(&dwarf_stack_traces, &stack_hash, &unwind_state->stack, BPF_ANY);
     if (err != 0) {
       LOG("[error] bpf_map_update_elem with ret: %d", err);
@@ -667,7 +670,7 @@ static __always_inline void add_stack(struct bpf_perf_event_data *ctx, u64 pid_t
     // bpf_get_stackid
     // ctx:当前BPF程序上下文
     // map:用来保存堆栈跟踪到ID映射的hash表
-    // flags:是否关注用户空间堆栈
+    // flags: 仅仅是获取用户的调用栈
     int stack_id = bpf_get_stackid(ctx, &stack_traces, BPF_F_USER_STACK);
     // `bpf_get_stackid` returns an error if two different stacks share
     // their hash, but not if stack unwinding failed due to the stack being

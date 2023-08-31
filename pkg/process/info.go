@@ -252,6 +252,7 @@ func (im *InfoManager) fetch(ctx context.Context, pid int) (info Info, err error
 	}
 
 	// Get the mappings of the process. This caches underlying object files for future needs.
+	// 获取进程的镜像
 	mappings, err := im.mapManager.MappingsForPID(pid)
 	if err != nil {
 		return Info{}, err

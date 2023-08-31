@@ -3,6 +3,7 @@ typedef unsigned int uint32_t;
 
 // murmurhash2 from
 // https://github.com/aappleby/smhasher/blob/92cf3702fcfaadc84eb7bef59825a23e0cd84f56/src/MurmurHash2.cpp
+// 不过，指针本身可以修改，指向不同的地址
 uint32_t MurmurHash2(const void *key, int len, uint32_t seed) {
   /* 'm' and 'r' are mixing constants generated offline.
      They're not really 'magic', they just happen to work well.  */

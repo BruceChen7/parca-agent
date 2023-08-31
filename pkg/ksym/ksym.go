@@ -60,6 +60,7 @@ func NewKsym(logger log.Logger, reg prometheus.Registerer, tempDir string, f ...
 	}
 }
 
+// 用来解析kernel的符号
 func (c *Ksym) Resolve(addrs map[uint64]struct{}) (map[uint64]string, error) {
 	c.mtx.RLock()
 	lastCacheInvalidation := c.lastCacheInvalidation

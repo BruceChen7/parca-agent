@@ -13,6 +13,7 @@ import (
 type Rule byte
 
 const (
+	// 寄存器规则
 	RuleUnknown Rule = iota
 	RuleUndefined
 	RuleSameVal
@@ -41,6 +42,7 @@ type UnwindRegisters struct {
 
 // DWRule wrapper of rule defined for register values.
 type DWRule struct {
+	// 是那种规则
 	Rule       Rule
 	Offset     int64
 	Reg        uint64
@@ -163,8 +165,10 @@ func (frame *Context) reset(cie *CommonInformationEntry) {
 }
 
 // Instructions used to recreate the table from the .debug_frame data.
+// https://blog.csdn.net/pwl999/article/details/107569603
 const (
-	DW_CFA_nop                = 0x0        // No ops
+	DW_CFA_nop = 0x0 // No ops
+	// CIE 中的指令，表示针对新的loc来设置CFA
 	DW_CFA_set_loc            = 0x01       // op1: address
 	DW_CFA_advance_loc1       = iota       // op1: 1-bytes delta
 	DW_CFA_advance_loc2                    // op1: 2-byte delta
@@ -402,11 +406,15 @@ func lookupFunc(instruction byte, ctx *Context) instruction {
 
 func setRule(reg uint64, frame *InstructionContext, rule DWRule) {
 	switch reg {
+	// rsp
 	case X86_64StackPointer:
+		// rsp
 		frame.Regs.StackPointer = rule
 	case X86_64FramePointer:
+		// rbp
 		frame.Regs.FramePointer = rule
 	case frame.RetAddrReg:
+		// return address
 		frame.Regs.SavedReturn = rule
 	}
 }
@@ -417,6 +425,7 @@ func restoreRule(reg uint64, frame *InstructionContext) {
 		if frame.initialRegs.StackPointer.Rule == RuleUnknown {
 			frame.Regs.StackPointer = DWRule{Rule: RuleUndefined}
 		} else {
+			// 恢复之前的
 			frame.Regs.StackPointer = DWRule{Offset: frame.initialRegs.StackPointer.Offset, Rule: RuleOffset}
 		}
 	case X86_64FramePointer:
@@ -457,6 +466,7 @@ func advanceloc1(ctx *Context) {
 		panic("Could not read byte")
 	}
 
+	// 设置当前frame的新pc，只是单位不一样
 	frame.loc += uint64(delta) * frame.codeAlignment
 }
 
@@ -513,6 +523,7 @@ func restore(ctx *Context) {
 }
 
 func setloc(ctx *Context) {
+	// 获取当前的frame
 	frame := ctx.currentInstruction()
 
 	var loc uint64
@@ -520,6 +531,7 @@ func setloc(ctx *Context) {
 	if err != nil {
 		panic("Could not read from buffer")
 	}
+	// 设置当前frame的新pc
 	frame.loc = loc + frame.cie.staticBase
 }
 
@@ -536,6 +548,7 @@ func offsetextended(ctx *Context) {
 }
 
 func undefined(ctx *Context) {
+	// 获取当前的frame指令
 	frame := ctx.currentInstruction()
 
 	reg, _ := util.DecodeULEB128(ctx.buf)
@@ -546,6 +559,7 @@ func undefined(ctx *Context) {
 func samevalue(ctx *Context) {
 	frame := ctx.currentInstruction()
 
+	// 解析出来的寄存器
 	reg, _ := util.DecodeULEB128(ctx.buf)
 	rule := DWRule{Rule: RuleSameVal}
 	setRule(reg, frame, rule)
@@ -569,11 +583,13 @@ func rememberstate(ctx *Context) {
 	}
 	state.regs = frame.Regs
 
+	// 记录一条RowState，就是readelf -wf中的一行
 	ctx.rememberedState.push(state)
 }
 
 func restorestate(ctx *Context) {
 	frame := ctx.currentInstruction()
+	// 恢复之前的frame
 	restored := ctx.rememberedState.pop()
 
 	frame.CFA = restored.cfa
@@ -587,13 +603,16 @@ func restoreextended(ctx *Context) {
 	restoreRule(reg, frame)
 }
 
+// 开议cfa规则
 func defcfa(ctx *Context) {
 	frame := ctx.currentInstruction()
 
+	// 寄存器
 	reg, _ := util.DecodeULEB128(ctx.buf)
 	offset, _ := util.DecodeULEB128(ctx.buf)
 
 	frame.CFA.Rule = RuleCFA
+	// 寄存器号
 	frame.CFA.Reg = reg
 	frame.CFA.Offset = int64(offset)
 }

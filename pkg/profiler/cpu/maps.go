@@ -332,6 +332,7 @@ func (m *bpfMaps) create() error {
 		return fmt.Errorf("get counts map: %w", err)
 	}
 
+	// 获取profile栈信息
 	stackTraces, err := m.module.GetMap(stackTracesMapName)
 	if err != nil {
 		return fmt.Errorf("get stack traces map: %w", err)

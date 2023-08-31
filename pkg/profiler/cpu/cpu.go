@@ -692,6 +692,7 @@ func (p *CPU) Run(ctx context.Context) error {
 		for pid, perProcessRawData := range groupedRawData {
 			processLastErrors[pid] = nil
 
+			// 获取进程的mapping信息
 			pi, err := p.processInfoManager.Info(ctx, pid)
 			if err != nil {
 				p.metrics.profileDrop.WithLabelValues(profileDropReasonProcessInfo).Inc()
@@ -729,6 +730,7 @@ func (p *CPU) Run(ctx context.Context) error {
 			// If we want to drop/disable a profiler, we should do it with another mechanism besides relabelling.
 			labelSet = labels.WithProfilerName(labelSet, p.Name())
 
+			// 保存结果信息，可以通过网络
 			if err := p.profileStore.Store(ctx, labelSet, pprof, executableInfos); err != nil {
 				level.Warn(p.logger).Log("msg", "failed to write profile", "pid", pid, "err", err)
 				processLastErrors[pid] = err
@@ -856,6 +858,16 @@ type profileKey struct {
 func (p *CPU) obtainRawData(ctx context.Context) (profile.RawData, error) {
 	rawData := map[profileKey]map[combinedStack]uint64{}
 
+	// 获取stackCounts， 是一个hash map
+	// typedef struct {
+	//   int pid;
+	//   int tid;
+	//   int user_stack_id;
+	//   int kernel_stack_id;
+	//   int user_stack_id_dwarf;
+	// } stack_count_key_t;
+
+	// read stack counts events
 	it := p.bpfMaps.stackCounts.Iterator()
 	for it.Next() {
 		if ctx.Err() != nil {
@@ -866,11 +878,13 @@ func (p *CPU) obtainRawData(ctx context.Context) (profile.RawData, error) {
 		// copied if we want to do anything with it outside this loop.
 		keyBytes := it.Key()
 
+		// 传过来的就是stackCounts
 		var key stackCountKey
 		// NOTICE: This works because the key struct in Go and the key struct in C has exactly the same memory layout.
 		// See the comment in stackCountKey for more details.
 		if err := binary.Read(bytes.NewBuffer(keyBytes), p.byteOrder, &key); err != nil {
 			p.metrics.stackDrop.WithLabelValues(labelStackDropReasonKey).Inc()
+			// 返回错误
 			return nil, fmt.Errorf("read stack count key: %w", err)
 		}
 
@@ -902,6 +916,7 @@ func (p *CPU) obtainRawData(ctx context.Context) (profile.RawData, error) {
 			}
 		} else {
 			// Stacks retrieved with the kernel's included frame pointer based unwinder.
+			// 根据user stack id 获取stack
 			userErr = p.bpfMaps.readUserStack(key.UserStackID, &stack)
 			if userErr != nil {
 				p.metrics.stackDrop.WithLabelValues(labelStackDropReasonUserFramePointer).Inc()
@@ -920,6 +935,7 @@ func (p *CPU) obtainRawData(ctx context.Context) (profile.RawData, error) {
 			}
 		}
 
+		// 获取kernel stack
 		kernelErr := p.bpfMaps.readKernelStack(key.KernelStackID, &stack)
 		if kernelErr != nil {
 			p.metrics.stackDrop.WithLabelValues(labelStackDropReasonKernel).Inc()
@@ -943,6 +959,7 @@ func (p *CPU) obtainRawData(ctx context.Context) (profile.RawData, error) {
 			continue
 		}
 
+		// 获取栈的调用统计
 		value, err := p.bpfMaps.readStackCount(keyBytes)
 		if err != nil {
 			p.metrics.stackDrop.WithLabelValues(labelStackDropReasonCount).Inc()
@@ -956,12 +973,14 @@ func (p *CPU) obtainRawData(ctx context.Context) (profile.RawData, error) {
 		}
 
 		perThreadData, ok := rawData[pKey]
+		// 创建远程
 		if !ok {
 			// We haven't seen this id yet.
 			perThreadData = map[combinedStack]uint64{}
 			rawData[pKey] = perThreadData
 		}
 
+		// 统计 + 1
 		perThreadData[stack] += value
 	}
 	if it.Err() != nil {
@@ -969,6 +988,7 @@ func (p *CPU) obtainRawData(ctx context.Context) (profile.RawData, error) {
 		return nil, fmt.Errorf("failed iterator: %w", it.Err())
 	}
 
+	// 用来清理BPF maps
 	if err := p.bpfMaps.finalizeProfileLoop(); err != nil {
 		level.Warn(p.logger).Log("msg", "failed to clean BPF maps that store stacktraces", "err", err)
 	}
@@ -981,6 +1001,7 @@ func (p *CPU) obtainRawData(ctx context.Context) (profile.RawData, error) {
 // stacks. Since the input data is a map of maps, we can assume that they're
 // already unique and there are no duplicates, which is why at this point we
 // can just transform them into plain slices and structs.
+// 打平整个数据
 func preprocessRawData(rawData map[profileKey]map[combinedStack]uint64) profile.RawData {
 	res := make(profile.RawData, 0, len(rawData))
 	for pKey, perThreadRawData := range rawData {

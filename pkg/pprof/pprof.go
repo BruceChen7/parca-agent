@@ -138,6 +138,7 @@ func (m *Manager) NewConverter(
 
 		threadNameCache: map[int]string{},
 
+		// 初始化
 		result: &pprofprofile.Profile{
 			TimeNanos:     captureTime.UnixNano(),
 			DurationNanos: int64(time.Since(captureTime)),
@@ -163,6 +164,7 @@ const (
 
 // Convert converts a profile to a pprof profile. It is intended to only be
 // used once.
+// 转成pprof profile 的格式
 func (c *Converter) Convert(ctx context.Context, rawData []profile.RawSample) (*pprofprofile.Profile, []*profilestorepb.ExecutableInfo, error) {
 	kernelAddresses := map[uint64]struct{}{}
 	for _, sample := range rawData {
@@ -171,12 +173,14 @@ func (c *Converter) Convert(ctx context.Context, rawData []profile.RawSample) (*
 		}
 	}
 
+	// kernel的符号
 	kernelSymbols, err := c.m.ksym.Resolve(kernelAddresses)
 	if err != nil {
 		level.Debug(c.logger).Log("msg", "failed to resolve kernel symbols skipping profile", "err", err)
 		kernelSymbols = map[uint64]string{}
 	}
 
+	// 获取进程信息
 	proc, err := c.pfs.Proc(c.pid)
 	if err != nil {
 		level.Debug(c.logger).Log("msg", "failed to get process info", "pid", c.pid, "err", err)
@@ -184,6 +188,7 @@ func (c *Converter) Convert(ctx context.Context, rawData []profile.RawSample) (*
 
 	for _, sample := range rawData {
 		pprofSample := &pprofprofile.Sample{
+			// 设置出现次数
 			Value:    []int64{int64(sample.Value)},
 			Location: make([]*pprofprofile.Location, 0, len(sample.UserStack)+len(sample.KernelStack)),
 			Label:    make(map[string][]string),
@@ -191,10 +196,12 @@ func (c *Converter) Convert(ctx context.Context, rawData []profile.RawSample) (*
 
 		for _, addr := range sample.KernelStack {
 			l := c.addKernelLocation(c.kernelMapping, kernelSymbols, addr)
+			// 将kernel的符号位置信息添加进去
 			pprofSample.Location = append(pprofSample.Location, l)
 		}
 
 		failedToNormalize := false
+		// 开始解析用户的堆栈
 		for _, addr := range sample.UserStack {
 			mappingIndex := mappingForAddr(c.result.Mapping, addr)
 			if mappingIndex == -1 {
@@ -203,7 +210,9 @@ func (c *Converter) Convert(ctx context.Context, rawData []profile.RawSample) (*
 				continue
 			}
 
+			// 找到对应的mapping
 			processMapping := c.mappings[mappingIndex]
+			// 找到pprofMapping
 			pprofMapping := c.result.Mapping[mappingIndex]
 			switch {
 			case pprofMapping.File == "[vdso]":
@@ -215,12 +224,14 @@ func (c *Converter) Convert(ctx context.Context, rawData []profile.RawSample) (*
 			default:
 				ei := c.addExecutableInfo(processMapping, addr)
 				c.executableInfos[mappingIndex] = ei
+				// 标准化地址
 				_, err := parcacol.NormalizeAddress(addr, ei, pprofMapping.Start, pprofMapping.Limit, pprofMapping.Offset)
 				if err != nil {
 					level.Debug(c.logger).Log("msg", "failed to normalize address", "addr", addr, "err", err)
 					failedToNormalize = true
 					break
 				}
+				// 设置了地址
 				pprofSample.Location = append(pprofSample.Location, c.addAddrLocation(pprofMapping, addr))
 			}
 		}
@@ -236,6 +247,7 @@ func (c *Converter) Convert(ctx context.Context, rawData []profile.RawSample) (*
 			pprofSample.Label[threadNameLabel] = append(pprofSample.Label[threadNameLabel], threadName)
 		}
 
+		// 获取设置
 		c.result.Sample = append(c.result.Sample, pprofSample)
 	}
 
