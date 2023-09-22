@@ -45,6 +45,9 @@ function deploy() {
     fi
 
     make -C deploy vendor
+    # Next, it uses "jsonnet" to generate the Kubernetes manifests for deploying the Parca system.
+    # The "version" and "serverVersion" parameters are passed to the "jsonnet" command to specify the version of the Parca agent
+    # and server to be deployed.
     jsonnet \
         --tla-str version="${AGENT_VERSION}" \
         --tla-str serverVersion="${SERVER_VERSION}" \

@@ -356,6 +356,7 @@ observable-dev/down:
 E2E_KUBECONTEXT := parca-e2e
 
 .PHONY: actions-e2e
+# 端对端进行测试
 actions-e2e:
 	# If running locally, first run:
 	#    minikube --profile=$(E2E_KUBECONTEXT) start --driver=virtualbox
