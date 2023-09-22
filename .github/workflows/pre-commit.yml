@@ -3,22 +3,23 @@ name: pre-commit
 on:
   push:
     branches:
-    - main
-    - release-*
+      - main
+      - release-*
   pull_request:
     branches:
-    - main
-    - release-*
+      - main
+      - release-*
 
+# https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idconcurrency
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 env:
   # renovate: datasource=pypi depName=pre-commit versioning=pep440
-  PRE_COMMIT_VERSION: ==3.3.3
+  PRE_COMMIT_VERSION: ==3.4.0
   # renovate: datasource=go depName=github.com/golangci/golangci-lint
-  GOLANGCI_LINT_VERSION: v1.54.1
+  GOLANGCI_LINT_VERSION: v1.54.2
 
 jobs:
   pre-commit:
@@ -40,7 +41,7 @@ jobs:
           skip_after_successful_duplicate: false
 
       - name: Checkout
-        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+        uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac # v4.0.0
         with:
           fetch-depth: 0
 
@@ -65,7 +66,7 @@ jobs:
 
       # Same as https://github.com/golangci/golangci-lint-action#caching-internals
       - name: Set up golangci-lint cache
-        uses: actions/cache@88522ab9f39a2ea568f7027eddc7d8d8bc9d59c8 # v3.3.1
+        uses: actions/cache@704facf57e6136b1bc63b828d79edcd491f0ee84 # v3.3.2
         with:
           path: |
             ~/.cache/golangci-lint
@@ -86,7 +87,7 @@ jobs:
           echo "PY_HASH=$(python -VV | sha256sum | cut -d' ' -f1)" >> $GITHUB_ENV
 
       - name: Set up pre-commit cache
-        uses: actions/cache@88522ab9f39a2ea568f7027eddc7d8d8bc9d59c8 # v3.3.1
+        uses: actions/cache@704facf57e6136b1bc63b828d79edcd491f0ee84 # v3.3.2
         with:
           path: ~/.cache/pre-commit
           key: pre-commit-go${{ env.GO_VERSION }}-${{ env.PY_HASH }}-${{ hashFiles('.pre-commit-config.yaml') }}
@@ -115,6 +116,6 @@ jobs:
 
           pre-commit run --show-diff-on-failure --color=always "${EXTRA_ARGS[@]}"
 
-      - name: 'pre-commit-ci-lite: Apply automatic fixes'
+      - name: "pre-commit-ci-lite: Apply automatic fixes"
         uses: pre-commit-ci/lite-action@2529d76d2c5ffdf2a85aa090c38949eada94d39d # v1.0.1
         if: always()

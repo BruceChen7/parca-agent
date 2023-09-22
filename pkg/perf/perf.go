@@ -41,7 +41,7 @@ type PerfMapCache struct {
 }
 
 type perfMapCacheValue struct {
-	m Map
+	m *Map
 
 	fileModTime time.Time
 	fileSize    int64
@@ -54,16 +54,19 @@ var (
 
 // TODO(kakkoyun): Add Parser type to wrap: fs and logger.
 
-func ReadPerfMap(fileName string) (Map, error) {
+func ReadPerfMap(
+	logger log.Logger,
+	fileName string,
+) (*Map, error) {
 	fd, err := os.Open(fileName)
 	if err != nil {
-		return Map{}, err
+		return nil, err
 	}
 	defer fd.Close()
 
 	stat, err := fd.Stat()
 	if err != nil {
-		return Map{}, err
+		return nil, err
 	}
 
 	// Estimate the number of lines in the map file
@@ -82,48 +85,60 @@ func ReadPerfMap(fileName string) (Map, error) {
 	r := bufio.NewReader(fd)
 	addrs := make([]MapAddr, 0, linesCount)
 	conv := newStringConverter(convBufSize)
+	i := 0
+	var multiError error
 	for {
 		b, err := r.ReadSlice('\n')
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			return Map{}, err
+			return nil, fmt.Errorf("read perf map line: %w", err)
 		}
 
 		line, err := parsePerfMapLine(b, conv)
 		if err != nil {
-			return Map{}, err
+			multiError = errors.Join(multiError, fmt.Errorf("parse perf map line %d: %w", i, err))
 		}
 
 		addrs = append(addrs, line)
+		i++
+	}
+
+	if multiError != nil {
+		level.Debug(logger).Log("msg", "some perf map lines failed to be parsed, this is somewhat expected, but this log line exists for potential troubleshooting", "err", multiError)
 	}
 	// Sorted by end address to allow binary search during look-up. End to find
 	// the (closest) address _before_ the end. This could be an inlined instruction
 	// within a larger blob.
-	sort.Slice(addrs, func(i, j int) bool {
+	sort.SliceStable(addrs, func(i, j int) bool {
 		return addrs[i].End < addrs[j].End
 	})
-	return Map{addrs: addrs}, nil
+
+	return (&Map{addrs: addrs}).Deduplicate(), nil
 }
 
 func parsePerfMapLine(b []byte, conv *stringConverter) (MapAddr, error) {
 	firstSpace := bytes.Index(b, []byte(" "))
 	if firstSpace == -1 {
-		return MapAddr{}, fmt.Errorf("invalid line: %s", b)
+		return MapAddr{}, errors.New("invalid line")
 	}
 
 	secondSpace := bytes.Index(b[firstSpace+1:], []byte(" "))
 	if secondSpace == -1 {
-		return MapAddr{}, fmt.Errorf("invalid line: %s", b)
+		return MapAddr{}, errors.New("invalid line")
 	}
 
 	addrBytes := b[:firstSpace]
 
 	// Some runtimes that produce perf maps optionally start memory
 	// addresses with "0x".
-	if addrBytes[0] == '0' && addrBytes[1] == 'x' {
+	if len(addrBytes) >= 2 && addrBytes[0] == '0' && addrBytes[1] == 'x' {
 		addrBytes = addrBytes[2:]
+	}
+
+	if len(b) < firstSpace+secondSpace+2 {
+		return MapAddr{}, errors.New("invalid line")
 	}
 
 	sizeBytes := b[firstSpace+1 : firstSpace+1+secondSpace]
@@ -131,14 +146,14 @@ func parsePerfMapLine(b []byte, conv *stringConverter) (MapAddr, error) {
 
 	start, err := parseHexToUint64(addrBytes)
 	if err != nil {
-		return MapAddr{}, fmt.Errorf("parsing start failed on %v: %w", string(b), err)
+		return MapAddr{}, fmt.Errorf("parsing start: %w", err)
 	}
 	size, err := parseHexToUint64(sizeBytes)
 	if err != nil {
-		return MapAddr{}, fmt.Errorf("parsing end failed on %v: %w", string(b), err)
+		return MapAddr{}, fmt.Errorf("parsing end: %w", err)
 	}
 	if start+size < start {
-		return MapAddr{}, fmt.Errorf("overflowed mapping: %v", string(b))
+		return MapAddr{}, errors.New("overflowed mapping")
 	}
 
 	if symbolBytes[len(symbolBytes)-1] == '\n' {
@@ -190,12 +205,12 @@ func (p *PerfMapCache) PerfMapForPID(pid int) (*Map, error) {
 
 	if v, ok := p.cache.Get(pid); ok {
 		if v.fileModTime == info.ModTime() && v.fileSize == info.Size() {
-			return &v.m, nil
+			return v.m, nil
 		}
 		level.Debug(p.logger).Log("msg", "cached value is outdated", "pid", pid)
 	}
 
-	m, err := ReadPerfMap(perfFile)
+	m, err := ReadPerfMap(p.logger, perfFile)
 	if err != nil {
 		return nil, err
 	}
@@ -205,5 +220,5 @@ func (p *PerfMapCache) PerfMapForPID(pid int) (*Map, error) {
 		fileModTime: info.ModTime(),
 		fileSize:    info.Size(),
 	})
-	return &m, nil
+	return m, nil
 }

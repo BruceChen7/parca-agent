@@ -123,9 +123,17 @@ func (mm *MapManager) MappingsForPID(pid int) (Mappings, error) {
 		return nil, errors.Join(ErrProcNotFound, fmt.Errorf("failed to read proc maps for proc %d: %w", pid, err))
 	}
 
+	// We only ever care about executable mappings.
+	executableMaps := make([]*procfs.ProcMap, 0, len(maps))
+	for _, m := range maps {
+		if m.Perms.Execute {
+			executableMaps = append(executableMaps, m)
+		}
+	}
+
 	res := make([]*Mapping, 0, len(maps))
 	var errs error
-	for _, m := range maps {
+	for _, m := range executableMaps {
 		mapping, err := mm.NewUserMapping(m, pid)
 		if err != nil {
 			var elfErr *elf.FormatError
@@ -219,11 +227,10 @@ func (mm *MapManager) NewUserMapping(pm *procfs.ProcMap, pid int) (*Mapping, err
 		return nil, fmt.Errorf("failed to open mapped object file: %w", err)
 	}
 
-	ef, release, err := obj.ELF()
+	ef, err := obj.ELF()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get ELF file: %w", err)
 	}
-	defer release()
 
 	m.BuildID = obj.BuildID
 
@@ -399,12 +406,11 @@ func (m *Mapping) ExecutableInfo(addr uint64) (*profilestorepb.ExecutableInfo, e
 				return
 			}
 
-			ef, release, err := obj.ELF()
+			ef, err := obj.ELF()
 			if err != nil {
 				m.executableInfoErr = fmt.Errorf("failed to get ELF file: %w", err)
 				return
 			}
-			defer release()
 
 			executableInfo, err := m.extractExecutableInfo(ef, addr)
 			if err != nil {

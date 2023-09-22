@@ -20,10 +20,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/pprof"
 	"net/url"
 	"os"
+	"os/exec"
 	"runtime"
 	runtimepprof "runtime/pprof"
 	"strconv"
@@ -31,12 +33,17 @@ import (
 	"time"
 
 	"github.com/alecthomas/kong"
+	libbpf "github.com/aquasecurity/libbpfgo"
 	"github.com/common-nighthawk/go-figure"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+
 	okrun "github.com/oklog/run"
 	debuginfopb "github.com/parca-dev/parca/gen/proto/go/parca/debuginfo/v1alpha1"
 	profilestorepb "github.com/parca-dev/parca/gen/proto/go/parca/profilestore/v1alpha1"
+	telemetrypb "github.com/parca-dev/parca/gen/proto/go/parca/telemetry/v1alpha1"
+
+	"github.com/armon/circbuf"
 	vtproto "github.com/planetscale/vtprotobuf/codec/grpc"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -59,6 +66,7 @@ import (
 	"github.com/parca-dev/parca-agent/pkg/buildinfo"
 	"github.com/parca-dev/parca-agent/pkg/byteorder"
 	"github.com/parca-dev/parca-agent/pkg/config"
+	"github.com/parca-dev/parca-agent/pkg/contained"
 	"github.com/parca-dev/parca-agent/pkg/cpuinfo"
 	"github.com/parca-dev/parca-agent/pkg/debuginfo"
 	"github.com/parca-dev/parca-agent/pkg/discovery"
@@ -117,7 +125,7 @@ type flags struct {
 	Node               string `default:"${hostname}"               help:"The name of the node that the process is running on. If on Kubernetes, this must match the Kubernetes node name."`
 	ConfigPath         string `default:""                          help:"Path to config file."`
 	MemlockRlimit      uint64 `default:"${default_memlock_rlimit}" help:"The value for the maximum number of bytes of memory that may be locked into RAM. It is used to ensure the agent can lock memory for eBPF maps. 0 means no limit."`
-	ObjectFilePoolSize int    `default:"512"                       help:"The maximum number of object files to keep in the pool. This is used to avoid re-reading object files from disk. It keeps FDs open, so it should be kept in sync with ulimits. 0 means no limit."`
+	ObjectFilePoolSize int    `default:"100"                       help:"The maximum number of object files to keep in the pool. This is used to avoid re-reading object files from disk. It keeps FDs open, so it should be kept in sync with ulimits. 0 means no limit."`
 
 	// pprof.
 	MutexProfileFraction int `default:"0" help:"Fraction of mutex profile samples to collect."`
@@ -134,10 +142,12 @@ type flags struct {
 
 	AnalyticsOptOut bool `default:"false" help:"Opt out of sending anonymous usage statistics."`
 
-	Hidden FlagsHidden `embed:"" hidden:"" prefix:""`
+	Telemetry FlagsTelemetry `embed:"" prefix:"telemetry-"`
+	Hidden    FlagsHidden    `embed:"" hidden:""           prefix:""`
 
-	// TODO: Move to FlagsBPF once we have more flags.
-	VerboseBpfLogging bool `help:"Enable verbose BPF logging."`
+	BPF FlagsBPF `embed:"" prefix:"bpf-"`
+	// Deprecated. Remove in few releases.
+	VerboseBpfLogging bool `help:"[deprecated] Use --bpf-verbose-logging. Enable verbose BPF logging."`
 }
 
 // FlagsLocalStore provides local store configuration flags.
@@ -211,9 +221,28 @@ type FlagsDWARFUnwinding struct {
 	Mixed   bool `default:"true"                                    help:"Unwind using .eh_frame information and frame pointers"`
 }
 
-// FlagsHidden contains hidden flags. Hidden debug flags (only for debugging).
+type FlagsTelemetry struct {
+	DisablePanicReporting bool  `default:"false"`
+	StderrBufferSizeKb    int64 `default:"4096"`
+}
+
+// FlagsHidden contains hidden flags used for debugging or running with untested configurations.
 type FlagsHidden struct {
 	DebugProcessNames []string `help:"Only attach profilers to specified processes. comm name will be used to match the given matchers. Accepts Go regex syntax (https://pkg.go.dev/regexp/syntax)." hidden:""`
+
+	AllowRunningAsNonRoot             bool `help:"Force running the Agent even if the user is not root. This will break a lot of the assumptions and result in the Agent malfunctioning."  hidden:""`
+	AllowRunningInNonRootPIDNamespace bool `help:"Force running the Agent in a non 'root' PID namespace. This will break a lot of the assumptions and result in the Agent malfunctioning." hidden:""`
+
+	EnablePythonUnwinding bool `default:"false" help:"Enable Python unwinding." hidden:""`
+	EnableRubyUnwinding   bool `default:"false" help:"Enable Ruby unwinding."   hidden:""`
+
+	ForcePanic bool `default:"false" help:"Panics the agent in a goroutine to test that telemetry works." hidden:""`
+}
+
+type FlagsBPF struct {
+	VerboseLogging         bool   `help:"Enable verbose BPF logging."`
+	EventsBufferSize       uint32 `default:"8192"                     help:"Size in pages of the events buffer."`
+	EventRateLimitsEnabled bool   `default:"true"                     help:"Whether to rate-limit BPF events."`
 }
 
 var _ Profiler = (*profiler.NoopProfiler)(nil)
@@ -225,6 +254,58 @@ type Profiler interface {
 	LastProfileStartedAt() time.Time
 	LastError() error
 	ProcessLastErrors() map[int]error
+}
+
+func isRoot() bool {
+	return os.Geteuid() == 0
+}
+
+func getRPCOptions(flags flags) []grpc.DialOption {
+	var opts []grpc.DialOption
+
+	if len(flags.RemoteStore.Address) > 0 {
+		if flags.RemoteStore.Insecure {
+			opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		} else {
+			config := &tls.Config{
+				//nolint:gosec
+				InsecureSkipVerify: flags.RemoteStore.InsecureSkipVerify,
+			}
+			opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(config)))
+		}
+
+		if flags.RemoteStore.BearerToken != "" {
+			opts = append(opts, grpc.WithPerRPCCredentials(
+				parcagrpc.NewPerRequestBearerToken(flags.RemoteStore.BearerToken, flags.RemoteStore.Insecure)),
+			)
+		}
+
+		if flags.RemoteStore.BearerTokenFile != "" {
+			b, err := os.ReadFile(flags.RemoteStore.BearerTokenFile)
+			if err != nil {
+				panic(fmt.Errorf("failed to read bearer token from file: %w", err))
+			}
+
+			opts = append(opts, grpc.WithPerRPCCredentials(
+				parcagrpc.NewPerRequestBearerToken(strings.TrimSpace(string(b)), flags.RemoteStore.Insecure)),
+			)
+		}
+	}
+	return opts
+}
+
+func getTelemetryMetadata() map[string]string {
+	r := make(map[string]string)
+	var si sysinfo.SysInfo
+	si.GetSysInfo()
+
+	r["git_commit"] = commit
+	r["agent_version"] = version
+	r["go_arch"] = runtime.GOARCH
+	r["kernel_release"] = si.Kernel.Release
+	r["cpu_cores"] = fmt.Sprint(cpuinfo.NumCPU())
+
+	return r
 }
 
 func main() {
@@ -254,12 +335,95 @@ func main() {
 		"default_cpu_sampling_frequency": strconv.Itoa(defaultCPUSamplingFrequency),
 	})
 
+	logger := logger.NewLogger(flags.Log.Level, flags.Log.Format, "parca-agent")
+
+	if !flags.Telemetry.DisablePanicReporting && len(flags.RemoteStore.Address) > 0 {
+		// Spawn ourselves in a child process but disabling telemetry in it.
+		argsCopy := make([]string, 0, len(os.Args)+1)
+		argsCopy = append(argsCopy, os.Args...)
+		argsCopy = append(argsCopy, "--telemetry-disable-panic-reporting")
+
+		buf, _ := circbuf.NewBuffer(flags.Telemetry.StderrBufferSizeKb)
+
+		cmd := exec.Command(argsCopy[0], argsCopy[1:]...) //nolint:gosec
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = io.MultiWriter(os.Stderr, buf)
+
+		// Run garbage collector to minimize the amount of memory that the parent
+		// telemetry process uses.
+		runtime.GC()
+		err := cmd.Run()
+		if err != nil {
+			level.Error(logger).Log("msg", "======================= unexpected error =======================")
+			level.Error(logger).Log("msg", "last stderr", "last_stderr", buf.String())
+			level.Error(logger).Log("msg", "================================================================")
+
+			level.Error(logger).Log("msg", "about to report error to server")
+
+			grpcLogger := log.NewNopLogger()
+			tp := trace.NewNoopTracerProvider()
+
+			opts := getRPCOptions(flags)
+			reg := prometheus.NewRegistry()
+
+			conn, err := parcagrpc.Conn(grpcLogger, reg, tp, flags.RemoteStore.Address, flags.RemoteStore.RPCUnaryTimeout, opts...)
+			if err != nil {
+				level.Error(logger).Log("msg", "failed to connect to server", "error", err)
+				os.Exit(1)
+			}
+			defer conn.Close()
+
+			telemetryClient := telemetrypb.NewTelemetryServiceClient(conn)
+			_, err = telemetryClient.ReportPanic(context.Background(), &telemetrypb.ReportPanicRequest{
+				Stderr:   buf.String(),
+				Metadata: getTelemetryMetadata(),
+			})
+			if err != nil {
+				level.Error(logger).Log("msg", "failed to call ReportPanic()", "error", err)
+				os.Exit(1) //nolint: gocritic
+			}
+
+			level.Info(logger).Log("msg", "report sent successfully")
+
+			if exiterr, ok := err.(*exec.ExitError); ok { //nolint: errorlint
+				os.Exit(exiterr.ExitCode())
+			}
+
+			os.Exit(2)
+		}
+
+		os.Exit(0)
+	}
+
+	// This *must* be below the panic telemetry code.
+	//
+	// Should only be called for testing as it will do
+	// what it says on the tin.
+	if flags.Hidden.ForcePanic {
+		go func() {
+			time.Sleep(5 * time.Second)
+
+			c := func() {
+				panic("forced panic for testing purposes")
+			}
+
+			b := func() {
+				c()
+			}
+
+			a := func() {
+				b()
+			}
+
+			a()
+		}()
+	}
+
 	if flags.Version {
 		fmt.Printf("parca-agent, version %s (commit: %s, date: %s), arch: %s\n", version, commit, date, goArch) //nolint:forbidigo
 		os.Exit(0)
 	}
 
-	logger := logger.NewLogger(flags.Log.Level, flags.Log.Format, "parca-agent")
 	level.Debug(logger).Log("msg", "parca-agent initialized",
 		"version", version,
 		"commit", commit,
@@ -278,6 +442,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	libbpf.SetLoggerCbs(libbpf.Callbacks{
+		Log: func(_ int, msg string) {
+			level.Debug(logger).Log("msg", msg)
+		},
+	})
+
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
 		collectors.NewBuildInfoCollector(),
@@ -288,9 +458,10 @@ func main() {
 	intro := figure.NewColorFigure("Parca Agent ", "roman", "yellow", true)
 	intro.Print()
 
+	// TODO(sylfrena): Entirely remove once full support for DWARF Unwinding Arm64 is added and production tested for a few days
 	if runtime.GOARCH == "arm64" {
-		flags.DWARFUnwinding.Disable = true
-		level.Info(logger).Log("msg", "ARM64 support is currently in beta. DWARF-based unwinding is not supported yet, see https://github.com/parca-dev/parca-agent/discussions/1376 for more details")
+		flags.DWARFUnwinding.Disable = false
+		level.Info(logger).Log("msg", "ARM64 support is currently in beta. DWARF-based unwinding is not fully supported yet, see https://github.com/parca-dev/parca-agent/discussions/1376 for more details")
 	}
 
 	// Memlock rlimit 0 means no limit.
@@ -322,7 +493,7 @@ func main() {
 		level.Warn(logger).Log("msg", "failed to get open file descriptor limit", "err", err)
 	}
 	if flags.ObjectFilePoolSize > ((max * 80) / 100) {
-		level.Warn(logger).Log("msg", "object file pool size is too high, it can impact overall machine performance", "size", flags.ObjectFilePoolSize, "max", max)
+		level.Warn(logger).Log("msg", "object file pool size is too high, it can result in elevated memory usage", "size", flags.ObjectFilePoolSize, "max", max)
 	}
 
 	if _, err := maxprocs.Set(maxprocs.Logger(func(format string, a ...interface{}) {
@@ -340,6 +511,13 @@ func main() {
 	}
 }
 
+func isPowerOfTwo(n uint32) bool {
+	if n == 0 {
+		return false
+	}
+	return (n & (n - 1)) == 0
+}
+
 func run(logger log.Logger, reg *prometheus.Registry, flags flags) error {
 	var (
 		ctx = context.Background()
@@ -347,6 +525,20 @@ func run(logger log.Logger, reg *prometheus.Registry, flags flags) error {
 		cfg              = &config.Config{}
 		configFileExists bool
 	)
+
+	if !isRoot() && !flags.Hidden.AllowRunningAsNonRoot {
+		return errors.New("superuser (root) is required to run Parca Agent to load and manipulate BPF programs")
+	}
+
+	isRootPIDNamespace, err := contained.IsRootPIDNamespace()
+	if err == nil {
+		if !isRootPIDNamespace && !flags.Hidden.AllowRunningInNonRootPIDNamespace {
+			level.Error(logger).Log("msg", "the agent can't run in a container, run with privileges and in the host PID (`hostPID: true` in Kubernetes, `--pid host` in Docker)")
+			os.Exit(1)
+		}
+	} else {
+		level.Error(logger).Log("msg", "could not figure out if we are contained", "err", err)
+	}
 
 	if flags.ConfigPath != "" {
 		configFileExists = true
@@ -356,6 +548,18 @@ func run(logger log.Logger, reg *prometheus.Registry, flags flags) error {
 			return fmt.Errorf("failed to read config: %w", err)
 		}
 		cfg = cfgFile
+	}
+
+	if flags.VerboseBpfLogging {
+		return errors.New("this flag has been renamed to --bpf-verbose-logging")
+	}
+
+	if !isPowerOfTwo(flags.BPF.EventsBufferSize) {
+		return errors.New("the BPF events buffer size should be a power of 2")
+	}
+
+	if flags.BPF.EventsBufferSize < 32 {
+		return errors.New("the BPF events buffer is too small, should be at least 32 pages")
 	}
 
 	// Initialize tracing.
@@ -377,17 +581,6 @@ func run(logger log.Logger, reg *prometheus.Registry, flags flags) error {
 		}
 	}
 
-	isContainer, err := isInContainer()
-	if err != nil {
-		level.Warn(logger).Log("msg", "failed to check if running in container", "err", err)
-	}
-
-	if isContainer {
-		level.Info(logger).Log(
-			"msg", "running in a container, need to access the host kernel config.",
-		)
-	}
-
 	if err := kernel.CheckBPFEnabled(); err != nil {
 		// TODO: Add a more definitive test for the cases kconfig fails.
 		// - https://github.com/libbpf/libbpf/blob/1714037104da56308ddb539ae0a362a9936121ff/src/libbpf.c#L4396-L4429
@@ -402,33 +595,7 @@ func run(logger log.Logger, reg *prometheus.Registry, flags flags) error {
 	if len(flags.RemoteStore.Address) > 0 {
 		encoding.RegisterCodec(vtproto.Codec{})
 
-		var opts []grpc.DialOption
-		if flags.RemoteStore.Insecure {
-			opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		} else {
-			config := &tls.Config{
-				//nolint:gosec
-				InsecureSkipVerify: flags.RemoteStore.InsecureSkipVerify,
-			}
-			opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(config)))
-		}
-
-		if flags.RemoteStore.BearerToken != "" {
-			opts = append(opts, grpc.WithPerRPCCredentials(
-				parcagrpc.NewPerRequestBearerToken(flags.RemoteStore.BearerToken, flags.RemoteStore.Insecure)),
-			)
-		}
-
-		if flags.RemoteStore.BearerTokenFile != "" {
-			b, err := os.ReadFile(flags.RemoteStore.BearerTokenFile)
-			if err != nil {
-				return fmt.Errorf("failed to read bearer token from file: %w", err)
-			}
-			opts = append(opts, grpc.WithPerRPCCredentials(
-				parcagrpc.NewPerRequestBearerToken(strings.TrimSpace(string(b)), flags.RemoteStore.Insecure)),
-			)
-		}
-
+		opts := getRPCOptions(flags)
 		var grpcLogger log.Logger
 		if !flags.RemoteStore.RPCLoggingEnable {
 			grpcLogger = log.NewNopLogger()
@@ -508,7 +675,7 @@ func run(logger log.Logger, reg *prometheus.Registry, flags flags) error {
 			cpuinfo.NumCPU(),
 			version,
 			si,
-			isContainer,
+			!isRootPIDNamespace,
 		)
 		ctx, cancel := context.WithCancel(ctx)
 		g.Add(func() error {
@@ -650,22 +817,26 @@ func run(logger log.Logger, reg *prometheus.Registry, flags flags) error {
 
 	nsCache := namespace.NewCache(logger, reg, flags.Profiling.Duration)
 
+	// All the metadata providers work best-effort.
+	providers := []metadata.Provider{
+		discoveryMetadata,
+		metadata.Target(flags.Node, flags.Metadata.ExternalLabels),
+		metadata.Compiler(logger, reg, ofp),
+		metadata.Process(pfs),
+		metadata.Java(logger, nsCache),
+		metadata.System(),
+		metadata.PodHosts(),
+	}
+	interpreterUnwindingEnabled := flags.Hidden.EnablePythonUnwinding || flags.Hidden.EnableRubyUnwinding
+	if interpreterUnwindingEnabled {
+		providers = append(providers, metadata.Interpreter(pfs, reg))
+	}
+
 	labelsManager := labels.NewManager(
 		log.With(logger, "component", "labels_manager"),
 		tp.Tracer("labels_manager"),
 		reg,
-		// All the metadata providers work best-effort.
-		[]metadata.Provider{
-			discoveryMetadata,
-			metadata.Target(flags.Node, flags.Metadata.ExternalLabels),
-			metadata.Compiler(logger, reg, ofp),
-			metadata.Process(pfs),
-			metadata.Java(logger, nsCache),
-			metadata.Ruby(pfs, reg, ofp),
-			metadata.Python(pfs, reg, ofp),
-			metadata.System(),
-			metadata.PodHosts(),
-		},
+		providers,
 		cfg.RelabelConfigs,
 		flags.Metadata.DisableCaching,
 		flags.Profiling.Duration, // Cache durations are calculated from profiling duration.
@@ -675,7 +846,7 @@ func run(logger log.Logger, reg *prometheus.Registry, flags flags) error {
 	vdsoResolver, err = vdso.NewCache(reg, ofp)
 	if err != nil {
 		vdsoResolver = vdso.NoopCache{}
-		level.Warn(logger).Log("msg", "failed to initialize vdso cache", "err", err)
+		level.Debug(logger).Log("msg", "failed to initialize vdso cache", "err", err)
 	}
 
 	var dbginfo process.DebuginfoManager
@@ -713,6 +884,7 @@ func run(logger log.Logger, reg *prometheus.Registry, flags flags) error {
 		labelsManager,
 		flags.Profiling.Duration,
 		flags.Debuginfo.UploadCacheDuration,
+		interpreterUnwindingEnabled,
 	)
 	{
 		logger := log.With(logger, "group", "process_info_manager")
@@ -743,16 +915,22 @@ func run(logger log.Logger, reg *prometheus.Registry, flags flags) error {
 				flags.Symbolizer.JITDisable,
 			),
 			profileStore,
-			flags.Profiling.Duration,
-			flags.Profiling.CPUSamplingFrequency,
-			flags.Profiling.PerfEventBufferPollInterval,
-			flags.Profiling.PerfEventBufferProcessingInterval,
-			flags.Profiling.PerfEventBufferWorkerCount,
-			flags.MemlockRlimit,
-			flags.Hidden.DebugProcessNames,
-			flags.DWARFUnwinding.Disable,
-			flags.DWARFUnwinding.Mixed,
-			flags.VerboseBpfLogging,
+			&cpu.Config{
+				ProfilingDuration:                 flags.Profiling.Duration,
+				ProfilingSamplingFrequency:        flags.Profiling.CPUSamplingFrequency,
+				PerfEventBufferPollInterval:       flags.Profiling.PerfEventBufferPollInterval,
+				PerfEventBufferProcessingInterval: flags.Profiling.PerfEventBufferProcessingInterval,
+				PerfEventBufferWorkerCount:        flags.Profiling.PerfEventBufferWorkerCount,
+				MemlockRlimit:                     flags.MemlockRlimit,
+				DebugProcessNames:                 flags.Hidden.DebugProcessNames,
+				DWARFUnwindingDisabled:            flags.DWARFUnwinding.Disable,
+				DWARFUnwindingMixedModeEnabled:    flags.DWARFUnwinding.Mixed,
+				BPFVerboseLoggingEnabled:          flags.BPF.VerboseLogging,
+				BPFEventsBufferSize:               flags.BPF.EventsBufferSize,
+				PythonUnwindingEnabled:            flags.Hidden.EnablePythonUnwinding,
+				RubyUnwindingEnabled:              flags.Hidden.EnableRubyUnwinding,
+				EventRateLimitsEnabled:            flags.BPF.EventRateLimitsEnabled,
+			},
 			bpfProgramLoaded,
 		),
 	}
@@ -1024,37 +1202,4 @@ func run(logger log.Logger, reg *prometheus.Registry, flags flags) error {
 	g.Add(okrun.SignalHandler(ctx, os.Interrupt, os.Kill))
 
 	return g.Run()
-}
-
-const containerCgroupPath = "/proc/1/cgroup"
-
-// isInContainer returns true is the process is running in a container
-// TODO: Add a container detection via Sched to cover more scenarios
-// https://man7.org/linux/man-pages/man7/sched.7.html
-func isInContainer() (bool, error) {
-	f, err := os.Open(containerCgroupPath)
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
-
-	b := make([]byte, 1024)
-	i, err := f.Read(b)
-	if err != nil {
-		return false, err
-	}
-
-	switch {
-	// CGROUP V1 docker container
-	case strings.Contains(string(b[:i]), "cpuset:/docker"):
-		return true, nil
-	// CGROUP V2 docker container
-	case strings.Contains(string(b[:i]), "0::/\n"):
-		return true, nil
-	// k8s container
-	case strings.Contains(string(b[:i]), "cpuset:/kubepods"):
-		return true, nil
-	}
-
-	return false, nil
 }

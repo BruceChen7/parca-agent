@@ -40,7 +40,7 @@ endif
 VERSION ?= $(if $(RELEASE_TAG),$(RELEASE_TAG),$(shell $(CMD_GIT) describe --tags || echo '$(subst /,-,$(BRANCH))$(COMMIT_TIMESTAMP)$(COMMIT)'))
 
 # renovate: datasource=docker depName=docker.io/goreleaser/goreleaser-cross
-GOLANG_CROSS_VERSION := v1.21.0
+GOLANG_CROSS_VERSION := v1.21.1
 
 # inputs and outputs:
 OUT_DIR ?= dist
@@ -59,8 +59,13 @@ LIBBPF_OBJ := $(LIBBPF_DIR)/libbpf.a
 VMLINUX := vmlinux.h
 BPF_ROOT := bpf
 BPF_SRC := $(BPF_ROOT)/cpu/cpu.bpf.c
-OUT_BPF_DIR := pkg/profiler/cpu/bpf/$(ARCH)
+OUT_BPF_DIR := pkg/profiler/cpu/bpf/programs/objects/$(ARCH)
+# TODO(kakkoyun): DRY.
 OUT_BPF := $(OUT_BPF_DIR)/cpu.bpf.o
+OUT_RBPERF := $(OUT_BPF_DIR)/rbperf.bpf.o
+OUT_PYPERF := $(OUT_BPF_DIR)/pyperf.bpf.o
+OUT_BPF_CONTAINED_DIR := pkg/contained/bpf/$(ARCH)
+OUT_PID_NAMESPACE := $(OUT_BPF_CONTAINED_DIR)/pid_namespace.bpf.o
 
 # CGO build flags:
 PKG_CONFIG ?= pkg-config
@@ -155,9 +160,13 @@ bpf: $(OUT_BPF)
 
 ifndef DOCKER
 $(OUT_BPF): $(BPF_SRC) libbpf | $(OUT_DIR)
-	mkdir -p $(OUT_BPF_DIR)
+	mkdir -p $(OUT_BPF_DIR) $(OUT_BPF_CONTAINED_DIR)
 	$(MAKE) -C bpf build
+	# TODO(kakkoyun): DRY.
 	cp bpf/out/$(ARCH)/cpu.bpf.o $(OUT_BPF)
+	cp bpf/out/$(ARCH)/rbperf.bpf.o $(OUT_RBPERF)
+	cp bpf/out/$(ARCH)/pyperf.bpf.o $(OUT_PYPERF)
+	cp bpf/out/$(ARCH)/pid_namespace.bpf.o $(OUT_PID_NAMESPACE)
 else
 $(OUT_BPF): $(DOCKER_BUILDER) | $(OUT_DIR)
 	$(call docker_builder_make,$@)
@@ -197,14 +206,14 @@ check-license:
 
 .PHONY: go/lint
 go/lint:
-	mkdir -p $(OUT_BPF_DIR)
-	touch $(OUT_BPF)
+	mkdir -p $(OUT_BPF_DIR) $(OUT_BPF_CONTAINED_DIR)
+	touch $(OUT_BPF) $(OUT_PID_NAMESPACE)
 	$(GO_ENV) $(CGO_ENV) golangci-lint run
 
 .PHONY: go/lint-fix
 go/lint-fix:
-	mkdir -p $(OUT_BPF_DIR)
-	touch $(OUT_BPF)
+	mkdir -p $(OUT_BPF_DIR) $(OUT_BPF_CONTAINED_DIR)
+	touch $(OUT_BPF) $(OUT_PID_NAMESPACE)
 	$(GO_ENV) $(CGO_ENV) golangci-lint run --fix
 
 .PHONY: bpf/lint-fix
@@ -215,7 +224,7 @@ test/profiler: $(GO_SRC) $(LIBBPF_HEADERS) $(LIBBPF_OBJ) bpf
 	sudo $(GO_ENV) $(CGO_ENV) $(GO) test $(SANITIZERS) -v ./pkg/profiler/... -count=1
 
 test/integration: $(GO_SRC) $(LIBBPF_HEADERS) $(LIBBPF_OBJ) bpf
-	sudo $(GO_ENV) $(CGO_ENV) $(GO) test $(SANITIZERS) -v ./test/integration/... -count=1
+	sudo --preserve-env=CI $(GO_ENV) $(CGO_ENV) $(GO) test $(SANITIZERS) -v ./test/integration/... -count=1
 
 .PHONY: test
 ifndef DOCKER
@@ -276,7 +285,8 @@ clean: mostlyclean
 	-rm -f kerneltest/cpu.test
 	-rm -f kerneltest/logs/vm_log_*.txt
 	-rm -f kerneltest/kernels/linux-*.bz
-	-rm -rf pkg/profiler/cpu/bpf/
+	-rm -rf pkg/profiler/cpu/bpf/programs/objects/
+	-rm -rf pkg/contained/bpf/
 	-rm -rf dist/
 	-rm -rf goreleaser/dist/
 

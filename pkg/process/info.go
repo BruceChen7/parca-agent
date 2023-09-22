@@ -37,6 +37,8 @@ import (
 
 	"github.com/parca-dev/parca-agent/pkg/cache"
 	"github.com/parca-dev/parca-agent/pkg/objectfile"
+	"github.com/parca-dev/parca-agent/pkg/runtime"
+	"github.com/parca-dev/parca-agent/pkg/runtime/interpreter"
 )
 
 type DebuginfoManager interface {
@@ -132,6 +134,8 @@ type InfoManager struct {
 
 	uploadJobQueue chan *uploadJob
 	uploadJobPool  *sync.Pool
+
+	shouldFetchInterpreterInfo bool
 }
 
 func NewInfoManager(
@@ -145,6 +149,7 @@ func NewInfoManager(
 	lm LabelManager,
 	profilingDuration time.Duration,
 	cacheTTL time.Duration,
+	fetchInterpreterInfo bool,
 ) *InfoManager {
 	im := &InfoManager{
 		logger:  logger,
@@ -176,6 +181,7 @@ func NewInfoManager(
 				return &uploadJob{}
 			},
 		},
+		shouldFetchInterpreterInfo: fetchInterpreterInfo,
 	}
 	return im
 }
@@ -189,7 +195,8 @@ type Info struct {
 	//   * "/proc/%d/root/tmp/perf-%d.map" or "/proc/%d/root/tmp/perf-%d.dump" for PerfMaps
 	//   * "/proc/%d/root/jit-%d.dump" for JITDUMP
 	// - Unwind Information
-	Mappings Mappings
+	Interpreter *runtime.Interpreter
+	Mappings    Mappings
 }
 
 func (i Info) Labels(ctx context.Context) (model.LabelSet, error) {
@@ -245,8 +252,7 @@ func (im *InfoManager) fetch(ctx context.Context, pid int) (info Info, err error
 	// Cache the executable path for future needs.
 	path := filepath.Join(fmt.Sprintf("/proc/%d/root", pid), exe)
 	if !(strings.Contains(path, "(deleted)") || strings.Contains(path, "memfd:")) {
-		_, err = im.objFilePool.Open(path)
-		if err != nil {
+		if _, err = im.objFilePool.Open(path); err != nil {
 			return Info{}, fmt.Errorf("failed to get executable object file for %s: %w", path, err)
 		}
 	}
@@ -261,13 +267,30 @@ func (im *InfoManager) fetch(ctx context.Context, pid int) (info Info, err error
 	// Upload debug information of the discovered object files.
 	im.ensureDebuginfoUploaded(ctx, mappings)
 
+	var interp *runtime.Interpreter
+	if im.shouldFetchInterpreterInfo {
+		// Fetch interpreter information.
+		// At this point we cannot tell if a process is a Python or Ruby interpreter so,
+		// we will pay the cost for the excluded one if only one of them enabled.
+		var err error
+		interp, err = interpreter.Fetch(proc)
+		if err != nil {
+			level.Debug(im.logger).Log("msg", "failed to fetch interpreter information", "err", err, "pid", pid)
+		}
+		if interp != nil {
+			level.Debug(im.logger).Log("msg", "interpreter information fetched", "interpreter", interp.Type, "version", interp.Version, "pid", pid)
+		}
+	}
+
 	// No matter what happens with the debug information, we should continue.
 	// And cache other process information.
 	info = Info{
-		im:       im,
-		pid:      pid,
-		Mappings: mappings,
+		im:          im,
+		pid:         pid,
+		Mappings:    mappings,
+		Interpreter: interp,
 	}
+
 	im.cache.Add(pid, info)
 
 	now = time.Now()

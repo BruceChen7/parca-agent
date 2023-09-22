@@ -26,20 +26,27 @@ type RawSample struct {
 	TID         PID
 	UserStack   []uint64
 	KernelStack []uint64
-	Value       uint64
+	// The interpreter stack is formed of the ids we need to fetch
+	// from the corresponding BPF map in order to fetch the interpreter
+	// frame.
+	InterpreterStack []uint64
+	Value            uint64
 }
 
 type RawData []ProcessRawData
 
 type Function struct {
-	Name      string
-	Filename  string
-	StartLine int
+	ModuleName string
+	Name       string
+	Filename   string
+	StartLine  int
 }
 
-type Line struct {
-	Function
-	Line int
+func (f Function) FullName() string {
+	if f.ModuleName == "" {
+		return f.Name
+	}
+	return f.ModuleName + "::" + f.Name
 }
 
 type Writer interface {
